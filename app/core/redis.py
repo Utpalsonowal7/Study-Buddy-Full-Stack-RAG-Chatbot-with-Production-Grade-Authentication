@@ -1,5 +1,4 @@
-from upstash_redis import Redis
-from app.config import REDIS_TOKEN,REDIS_URL
+from redis.asyncio import Redis
+from app.config import REDIS_URL
 
-redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
-redis.set("foo", "bar")
+redis = Redis.from_url(REDIS_URL)

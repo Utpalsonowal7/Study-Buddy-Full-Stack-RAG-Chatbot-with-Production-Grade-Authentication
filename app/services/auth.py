@@ -3,7 +3,7 @@ import secrets
 from urllib.parse import urlencode
 
 from fastapi import BackgroundTasks, HTTPException, Request, Response
-from fastapi.responses import  RedirectResponse
+from fastapi.responses import RedirectResponse
 import httpx
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -42,6 +42,7 @@ from app.config import (
     FRONT_END_URL,
 )
 
+
 async def _set_auth_cookies(
     res: Response,
     req: Request,
@@ -51,11 +52,11 @@ async def _set_auth_cookies(
     tokens = create_auth_tokens({"sub": str(user_id)})
 
     session = Session(
-        userId=user_id,
-        refreshToken=tokens["refresh_token"],
-        expiresAt=datetime.now(timezone.utc) + timedelta(days=30),
-        userAgent=req.headers.get("user-agent"),
-        ipAddress=req.client.host if req.client else None,
+        user_id=user_id,
+        refresh_token_hash=tokens["refresh_token"],
+        expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        user_agent=req.headers.get("user-agent"),
+        ip_address=req.client.host if req.client else None,
     )
 
     db.add(session)
@@ -87,7 +88,6 @@ async def send_otp(
 ):
     key = otp_key(email)
 
-   
     if await redis.get(key):
         raise HTTPException(
             status_code=400,
@@ -134,7 +134,6 @@ async def verify_otp(
             detail="Invalid OTP. Please try again.",
         )
 
-  
     await redis.delete(key)
 
     return success_response(
@@ -160,9 +159,7 @@ async def register_user(
         )
 
     user = User(
-        email=request.email,
-        full_name=request.full_name,
-        is_email_verified=True
+        email=request.email, full_name=request.full_name, is_email_verified=True
     )
 
     db.add(user)
@@ -269,7 +266,6 @@ async def google_login_redirect() -> RedirectResponse:
 
 async def google_callback(
     code: str,
-    state: str,
     request: Request,
     db: AsyncSession,
 ) -> RedirectResponse:
@@ -348,7 +344,7 @@ async def google_callback(
                 detail="Account already exists with email/password",
             )
 
-        if user.provider == "GOOGLE" and user.providerId != google_id:
+        if user.provider == "GOOGLE" and user.provider_id != google_id:
             raise HTTPException(
                 status_code=400,
                 detail="Google account does not match",
@@ -359,9 +355,9 @@ async def google_callback(
             name=name,
             email=email,
             password=None,
-            isEmailVerified=True,
+            is_email_verified=True,
             provider="GOOGLE",
-            providerId=google_id,
+            provider_id=google_id,
             avatar=avatar,
         )
 
@@ -379,7 +375,7 @@ async def google_callback(
         await db.refresh(user)
 
     redirect_response = RedirectResponse(
-        url=f"{FRONT_END_URL.rstrip('/')}/dashboard",
+        url=f"{FRONT_END_URL.rstrip('/')}/home",
         status_code=302,
     )
 
@@ -511,7 +507,6 @@ async def github_callback(
 
         await db.refresh(user)
 
-  
     redirect_response = RedirectResponse(url=f"{FRONT_END_URL}dashboard")
     await _set_auth_cookies(redirect_response, request, user.id, db)
 

@@ -137,13 +137,11 @@ async def google_login():
 )
 async def google_auth_callback(
     code: str,
-    state: str,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     return await google_callback(
         code,
-        state,
         request,
         db,
     )

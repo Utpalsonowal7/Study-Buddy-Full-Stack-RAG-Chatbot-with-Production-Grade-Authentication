@@ -1,5 +1,6 @@
 from fastapi import FastAPI, APIRouter
 from contextlib import asynccontextmanager
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.db.database import engine, Base
 
@@ -20,13 +21,30 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+origins = [
+    "http://localhost:3000",
+    "https://yourdomain.com",
+    "http://127.0.0.1:5500",
+    "http://localhost:5173",
+    "https://thu-phi.vercel.app",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 api_roter = APIRouter(prefix="/api/v1")
 
 api_roter.include_router(auth_router)
 
+app.include_router(api_roter)
+
 
 @app.get("/")
 def root():
     return {"hello world"}
-
