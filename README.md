@@ -30,13 +30,13 @@ uv sync --frozen --python 3.14
 cp .env.example .env  # only if you do not already have a .env
 ```
 
-Replace `GEMINI_API_KEY`, `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` in `.env` or secure deployment environment variables. Set separate random JWT signing keys, retaining the existing spelling `JWT_ACCESS_TOKEN_SECRECT`. Do not commit credentials. Missing or placeholder RAG/Cloudinary credentials return HTTP 503; no upload or model call is attempted with them.
+Replace `RAG_API_KEY` (or its `GEMINI_API_KEY` alias), `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` in `.env` or secure deployment environment variables. Set separate random JWT signing keys, retaining the existing spelling `JWT_ACCESS_TOKEN_SECRECT`. Do not commit credentials. Missing or placeholder RAG/Cloudinary credentials return HTTP 503; no upload or model call is attempted with them.
 
 The AI service uses the **native Gemini Developer API**. Create your key in [Google AI Studio](https://aistudio.google.com/app/apikey) and configure:
 
 ```dotenv
-GEMINI_API_KEY=replace_me_with_your_gemini_key
-GEMINI_API_BASE_URL=https://generativelanguage.googleapis.com/v1beta
+RAG_API_KEY=replace_me_with_your_gemini_key
+RAG_API_BASE_URL=https://generativelanguage.googleapis.com/v1beta
 RAG_EMBEDDING_MODEL=gemini-embedding-001
 RAG_CHAT_MODEL=gemini-3.1-flash-lite
 ```
@@ -45,7 +45,7 @@ RAG_CHAT_MODEL=gemini-3.1-flash-lite
 
 The default chat model is `gemini-3.1-flash-lite`, as requested. Set `RAG_CHAT_MODEL` to another Gemini text model available to your key if needed; live model availability has not been verified without credentials. The embedding client supports models with the `gemini-embedding-001` retrieval task contract; switching to `gemini-embedding-2` requires adapting its task instructions, not just changing the model name.
 
-If you already copied the older `.env.example`, update your existing `.env` entries manually. `RAG_API_KEY` and `RAG_API_BASE_URL` from the OpenAI version are no longer used. Old `text-embedding-3-large`/`gpt-4o-mini` model values must also be replaced. Documents indexed with OpenAI embeddings must be deleted and re-uploaded to generate Gemini embeddings; the API rejects mismatched embedding models rather than mixing vector spaces. Existing tables, Cloudinary settings, and folder structure are unchanged by this provider switch.
+If you already copied the older `.env.example`, update your existing `.env` entries manually. Both `RAG_API_KEY`/`RAG_API_BASE_URL` and `GEMINI_API_KEY`/`GEMINI_API_BASE_URL` are supported; the `RAG_API_*` names take precedence when both are set. Regardless of the variable name, the key must be a Gemini key and the endpoint must target the native Gemini API. The old `https://api.openai.com/v1` endpoint is rejected before sending a Gemini key. Old `text-embedding-3-large`/`gpt-4o-mini` model values must also be replaced. Documents indexed with OpenAI embeddings must be deleted and re-uploaded to generate Gemini embeddings; the API rejects mismatched embedding models rather than mixing vector spaces. Existing tables, Cloudinary settings, and folder structure are unchanged by this provider switch.
 
 Request formats were checked against Google's [official API definitions](https://github.com/googleapis/googleapis/blob/master/google/ai/generativelanguage/v1beta/generative_service.proto) and [embedding cookbook](https://github.com/google-gemini/cookbook/blob/main/quickstarts/Embeddings.ipynb). Real calls still require a valid key with access and quota for the configured models.
 

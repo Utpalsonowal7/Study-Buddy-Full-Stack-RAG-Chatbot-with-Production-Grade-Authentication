@@ -217,7 +217,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
 
     def test_gemini_defaults_and_existing_model_resource_names(self):
         with patch.dict(os.environ, {"GEMINI_API_KEY": "test-gemini-key"}):
-            for name in ["GEMINI_API_BASE_URL", "RAG_EMBEDDING_MODEL", "RAG_CHAT_MODEL"]:
+            for name in ["GEMINI_API_BASE_URL", "RAG_API_BASE_URL", "RAG_API_KEY", "RAG_EMBEDDING_MODEL", "RAG_CHAT_MODEL"]:
                 os.environ.pop(name, None)
             configured = Settings.from_env()
         self.assertEqual(configured.api_key, "test-gemini-key")
@@ -227,6 +227,22 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(AIProvider.model_path("models/gemini-embedding-001"), "models/gemini-embedding-001")
         with self.assertRaises(HTTPException):
             AIProvider.model_path("../invalid/model")
+
+    def test_generic_rag_names_override_gemini_aliases(self):
+        with patch.dict(os.environ, {"RAG_API_KEY": "generic-gemini-key", "GEMINI_API_KEY": "alias-key",
+                                     "RAG_API_BASE_URL": "https://generativelanguage.googleapis.com/v1beta",
+                                     "GEMINI_API_BASE_URL": "https://unused.example.com"}):
+            configured = Settings.from_env()
+        self.assertEqual(configured.api_key, "generic-gemini-key")
+        self.assertEqual(configured.api_url, "https://generativelanguage.googleapis.com/v1beta")
+
+    async def test_legacy_openai_endpoint_is_rejected_before_sending_gemini_key(self):
+        provider = AIProvider(replace(settings(), api_url="https://api.openai.com/v1"))
+        with patch("app.services.ai.httpx.AsyncClient") as client:
+            with self.assertRaises(HTTPException) as raised:
+                await provider.embed(["text"])
+            self.assertEqual(raised.exception.status_code, 503)
+            client.assert_not_called()
 
     async def test_placeholder_and_invalid_provider_outputs(self):
         with self.assertRaises(HTTPException) as raised:

@@ -1,5 +1,6 @@
 import math
 import re
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import HTTPException
@@ -21,10 +22,14 @@ class AIProvider:
             raise HTTPException(503, "Configure a valid Gemini model name in the server environment.")
         return f"models/{name}"
 
+    def validate_api_url(self) -> None:
+        url = urlsplit(self.settings.api_url)
+        if url.scheme != "https" or not url.hostname or url.hostname == "api.openai.com":
+            raise HTTPException(503, "Configure an HTTPS Gemini API base URL, such as https://generativelanguage.googleapis.com/v1beta.")
+
     async def _request(self, endpoint: str, payload: dict) -> dict:
         require_credentials(self.settings.api_key)
-        if not self.settings.api_url.startswith("https://"):
-            raise HTTPException(503, "The Gemini API URL must use HTTPS.")
+        self.validate_api_url()
         try:
             async with httpx.AsyncClient(timeout=90) as client:
                 response = await client.post(
@@ -122,8 +127,7 @@ class AIProvider:
     async def answer_stream(self, question: str, sources: list[dict], history: list[dict]):
         """Yield actual Gemini text deltas as received, before the answer completes."""
         require_credentials(self.settings.api_key)
-        if not self.settings.api_url.startswith("https://"):
-            raise HTTPException(503, "The Gemini API URL must use HTTPS.")
+        self.validate_api_url()
         model = self.model_path(self.settings.chat_model)
         finished, has_text, size = False, False, 0
         try:
