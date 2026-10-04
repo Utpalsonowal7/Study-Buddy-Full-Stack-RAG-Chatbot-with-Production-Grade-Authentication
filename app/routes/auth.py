@@ -201,7 +201,7 @@ async def get_me(
         "name": current_user.name,
         "email": current_user.email,
         "avatar": (current_user.avatar or "https://placehold.net/avatar-2.svg"),
-        "is_verified": current_user.isEmailVerified,
+        "is_verified": current_user.is_email_verified,
     }
 
 
