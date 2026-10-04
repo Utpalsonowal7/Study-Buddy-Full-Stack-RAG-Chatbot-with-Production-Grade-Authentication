@@ -854,6 +854,7 @@ name = "study-buddy"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "asyncpg" },
     { name = "brevo-python" },
     { name = "cloudinary" },
@@ -870,6 +871,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.15.1" },
     { name = "asyncpg", specifier = ">=0.31.0" },
     { name = "brevo-python", specifier = ">=5.0.2" },
     { name = "cloudinary", specifier = ">=1.44.1" },

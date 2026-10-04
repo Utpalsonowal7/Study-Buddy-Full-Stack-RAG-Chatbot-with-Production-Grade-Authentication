@@ -66,7 +66,7 @@ class RagSettings:
             api_key=os.getenv("GEMINI_API_KEY", ""),
             api_url=os.getenv("GEMINI_API_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/"),
             embedding_model=os.getenv("RAG_EMBEDDING_MODEL", "gemini-embedding-001"),
-            chat_model=os.getenv("RAG_CHAT_MODEL", "gemini-flash-latest"),
+            chat_model=os.getenv("RAG_CHAT_MODEL", "gemini-3.1-flash-lite"),
             cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", ""),
             cloud_key=os.getenv("CLOUDINARY_API_KEY", ""),
             cloud_secret=os.getenv("CLOUDINARY_API_SECRET", ""),

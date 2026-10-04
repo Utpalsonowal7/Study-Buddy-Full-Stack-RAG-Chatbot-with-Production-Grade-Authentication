@@ -1,4 +1,6 @@
 import json
+import asyncio
+import socket
 import os
 import secrets
 import unittest
@@ -26,6 +28,7 @@ from app.utils.documents import extract_chunks, safe_filename
 from app.services.ai import AIProvider
 from app.services.cloudinary import CloudinaryStorage
 from app.config import RagSettings as Settings
+from app.utils.sse import decode_json_events, encode_event
 
 
 def vector(index=0):
@@ -89,6 +92,27 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 400)
 
 
+class SSETests(unittest.IsolatedAsyncioTestCase):
+    async def test_multiline_events_comments_and_unicode(self):
+        async def lines():
+            for line in [": heartbeat", "event: message", "data: {", 'data: "text": "🌱\\nSecond line"}', "", "data: [DONE]", ""]:
+                yield line
+        self.assertEqual([event async for event in decode_json_events(lines())], [{"text": "🌱\nSecond line"}])
+        frame = encode_event("delta", {"text": "line\nevent: injected"})
+        self.assertEqual(frame.count("event:"), 2)  # one header, one escaped JSON string
+        self.assertEqual(frame.count("\ndata:"), 1)
+        self.assertEqual(frame.count("\n\n"), 1)
+
+    async def test_invalid_stream_data_is_rejected(self):
+        for payload in ["not json", "[]"]:
+            async def lines():
+                yield "data: " + payload
+                yield ""
+            with self.assertRaises(HTTPException) as raised:
+                [event async for event in decode_json_events(lines())]
+            self.assertEqual(raised.exception.status_code, 502)
+
+
 class ProviderTests(unittest.IsolatedAsyncioTestCase):
     async def test_gemini_wire_format_task_types_and_conversation(self):
         requests = []
@@ -121,6 +145,49 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("untrusted", requests[2][1]["systemInstruction"]["parts"][0]["text"])
         self.assertEqual([content["role"] for content in requests[2][1]["contents"]], ["user", "model", "user"])
         self.assertIn("[1] notes.txt", requests[2][1]["contents"][-1]["parts"][0]["text"])
+
+    async def test_gemini_stream_delivers_first_text_before_completion(self):
+        gate = asyncio.Event()
+        class GatedStream(httpx.AsyncByteStream):
+            closed = False
+            async def __aiter__(self):
+                first = encode_event("message", {"candidates": [{"content": {"parts": [{"text": "First 🌱 "}]}}]}).encode()
+                for piece in [first[:35], first[35:]]:
+                    yield piece
+                await gate.wait()
+                yield encode_event("message", {"candidates": [{"content": {"parts": [{"text": "second [1]."}]}, "finishReason": "STOP"}]}).encode()
+            async def aclose(self):
+                self.closed = True
+        body = GatedStream()
+        def handler(request):
+            self.assertEqual(request.url.path, "/v1beta/models/test-chat:streamGenerateContent")
+            self.assertEqual(request.url.query, b"alt=sse")
+            self.assertEqual(request.headers["x-goog-api-key"], "test-key")
+            payload = json.loads(request.content)
+            self.assertEqual(payload["generationConfig"]["temperature"], 0.2)
+            self.assertIn("short answers short", payload["systemInstruction"]["parts"][0]["text"])
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=body)
+        real_client = httpx.AsyncClient
+        with patch("app.services.ai.httpx.AsyncClient", side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)):
+            stream = AIProvider(settings()).answer_stream("Explain", [], [])
+            self.assertEqual(await asyncio.wait_for(anext(stream), 1), "First 🌱 ")
+            self.assertFalse(gate.is_set())
+            gate.set()
+            self.assertEqual(await anext(stream), "second [1].")
+            with self.assertRaises(StopAsyncIteration):
+                await anext(stream)
+        self.assertTrue(body.closed)
+
+    async def test_gemini_stream_rejects_truncated_response(self):
+        body = encode_event("message", {"candidates": [{"content": {"parts": [{"text": "Partial"}]}}]})
+        real_client = httpx.AsyncClient
+        with patch("app.services.ai.httpx.AsyncClient", side_effect=lambda **kw: real_client(
+                transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)), **kw)):
+            stream = AIProvider(settings()).answer_stream("Explain", [], [])
+            self.assertEqual(await anext(stream), "Partial")
+            with self.assertRaises(HTTPException) as raised:
+                await anext(stream)
+            self.assertEqual(raised.exception.status_code, 502)
 
     async def test_gemini_embedding_batches_preserve_order(self):
         ai = AIProvider(settings())
@@ -156,7 +223,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(configured.api_key, "test-gemini-key")
         self.assertEqual(configured.api_url, "https://generativelanguage.googleapis.com/v1beta")
         self.assertEqual(configured.embedding_model, "gemini-embedding-001")
-        self.assertEqual(configured.chat_model, "gemini-flash-latest")
+        self.assertEqual(configured.chat_model, "gemini-3.1-flash-lite")
         self.assertEqual(AIProvider.model_path("models/gemini-embedding-001"), "models/gemini-embedding-001")
         with self.assertRaises(HTTPException):
             AIProvider.model_path("../invalid/model")
@@ -201,6 +268,160 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "Set TEST_DATABASE_URL to an isolated PostgreSQL test database")
 class RagIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sse_chat_delivers_incrementally_and_rolls_back_failed_or_disconnected_streams(self):
+        import uvicorn
+        from sqlalchemy import delete, select, func
+        from app.main import app
+        from app.db.database import engine, LocalSession
+        from app.models.auth.user import User
+        from app.models.rag import Document, DocumentChunk, DocumentStatus, Conversation, Message, MessageRole
+        from app.dependencies.rag import get_ai, get_settings
+        from app.utils.jwt import create_access_token
+
+        ai = AIProvider(settings())
+        ai.embed = AsyncMock(side_effect=lambda texts, **kwargs: [vector() for _ in texts])
+        gate = asyncio.Event()
+        closed = asyncio.Event()
+        async def chunks(question, sources, history):
+            try:
+                yield "First "
+                await gate.wait()
+                yield "second [1]."
+            finally:
+                closed.set()
+        ai.answer_stream = chunks
+        app.dependency_overrides.update({get_ai: lambda: ai, get_settings: settings})
+        server = server_task = None
+        user_id = None
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        async def read_event(lines):
+            event, data = None, []
+            async for line in lines:
+                if line.startswith("event:"):
+                    event = line[6:].strip()
+                elif line.startswith("data:"):
+                    data.append(line[5:].strip())
+                elif not line and data:
+                    return event, json.loads("\n".join(data))
+            raise AssertionError("Stream ended before the expected event")
+        async def next_event(lines):
+            return await asyncio.wait_for(read_event(lines), 5)
+        try:
+            async with app.router.lifespan_context(app):
+                async with LocalSession() as db:
+                    user = User(email=f"sse-{secrets.token_hex(8)}@example.com", name="Streaming student")
+                    db.add(user)
+                    await db.flush()
+                    user_id = user.id
+                    document = Document(userId=user.id, name="notes.txt", originalName="notes.txt", fileUrl="https://example.com/private",
+                                        cloudinaryPublicId=f"test-{secrets.token_hex(8)}", fileType="text/plain", fileSize=42,
+                                        status=DocumentStatus.READY, embeddingModel=settings().embedding_model, chunkCount=1)
+                    db.add(document)
+                    await db.flush()
+                    db.add(DocumentChunk(documentId=document.id, chunkIndex=0, content="First second", embedding=vector()))
+                    await db.commit()
+                server = uvicorn.Server(uvicorn.Config(app, log_level="error", lifespan="off"))
+                server_task = asyncio.create_task(server.serve(sockets=[sock]))
+                async with asyncio.timeout(5):
+                    while not server.started:
+                        await asyncio.sleep(0.01)
+                headers = {"Cookie": f"access_token={create_access_token({'sub': str(user_id)})}"}
+                with patch("app.dependencies.rate_limit.rate_limit", new=AsyncMock()):
+                    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", headers=headers) as client:
+                        async with client.stream("POST", "/api/v1/rag/chat/stream", json={"question": "Explain", "document_ids": [document.id]}) as response:
+                            self.assertEqual(response.status_code, 200)
+                            self.assertIn("text/event-stream", response.headers["Content-Type"])
+                            self.assertEqual(response.headers["X-Accel-Buffering"], "no")
+                            lines = response.aiter_lines()
+                            event, metadata = await next_event(lines)
+                            self.assertEqual(event, "meta")
+                            self.assertEqual(metadata["sources"][0]["document_id"], document.id)
+                            self.assertEqual(await next_event(lines), ("delta", {"text": "First "}))
+                            self.assertFalse(gate.is_set(), "First chunk must arrive before generation completes")
+                            async with LocalSession() as db:
+                                self.assertEqual(await db.scalar(select(func.count(Message.id)).where(Message.conversationId == metadata["conversation_id"])), 0)
+                            gate.set()
+                            self.assertEqual(await next_event(lines), ("delta", {"text": "second [1]."}))
+                            event, done = await next_event(lines)
+                            self.assertEqual(event, "done")
+                            self.assertEqual(done["conversation_id"], metadata["conversation_id"])
+                            self.assertGreater(done["message_id"], 0)
+                            self.assertEqual([line async for line in lines], [])
+                        response = await client.get(f"/api/v1/rag/conversations/{metadata['conversation_id']}/messages")
+                        self.assertEqual(response.status_code, 200)
+                        self.assertEqual([message["content"] for message in response.json()], ["Explain", "First second [1]."])
+                        self.assertTrue(closed.is_set())
+
+                        async def fail_save(db, context, answer):
+                            # Trigger a real FK error, which expires ORM state during rollback.
+                            db.add(Message(conversationId=-1, role=MessageRole.ASSISTANT, content=answer))
+                            await db.flush()
+                        with patch("app.services.rag.persist_chat", side_effect=fail_save), patch("app.services.rag.logger.error") as log:
+                            async with client.stream("POST", "/api/v1/rag/chat/stream", json={"question": "Storage failure", "conversation_id": metadata["conversation_id"]}) as response:
+                                lines = response.aiter_lines()
+                                self.assertEqual((await next_event(lines))[0], "meta")
+                                self.assertEqual((await next_event(lines))[0], "delta")
+                                self.assertEqual((await next_event(lines))[0], "delta")
+                                event, error = await next_event(lines)
+                                self.assertEqual((event, error["status"]), ("error", 500))
+                                self.assertEqual([line async for line in lines], [])
+                            log.assert_called_once()
+                        response = await client.get(f"/api/v1/rag/conversations/{metadata['conversation_id']}/messages")
+                        self.assertEqual(len(response.json()), 2)
+
+                        async def fail(question, sources, history):
+                            yield "Partial "
+                            raise HTTPException(502, "Gemini stream failed")
+                        ai.answer_stream = fail
+                        async with client.stream("POST", "/api/v1/rag/chat/stream", json={"question": "Failure"}) as response:
+                            lines = response.aiter_lines()
+                            _, failed_meta = await next_event(lines)
+                            self.assertEqual(await next_event(lines), ("delta", {"text": "Partial "}))
+                            event, error = await next_event(lines)
+                            self.assertEqual((event, error["status"]), ("error", 502))
+                            self.assertEqual([line async for line in lines], [])
+                        async with LocalSession() as db:
+                            self.assertIsNone(await db.get(Conversation, failed_meta["conversation_id"]))
+
+                        gate = asyncio.Event()
+                        closed = asyncio.Event()
+                        ai.answer_stream = chunks
+                        async with client.stream("POST", "/api/v1/rag/chat/stream", json={"question": "Disconnect"}) as response:
+                            lines = response.aiter_lines()
+                            _, disconnected_meta = await next_event(lines)
+                            self.assertEqual(await next_event(lines), ("delta", {"text": "First "}))
+                        await asyncio.wait_for(closed.wait(), 5)
+                        async with asyncio.timeout(5):
+                            while True:
+                                async with LocalSession() as db:
+                                    if await db.get(Conversation, disconnected_meta["conversation_id"]) is None:
+                                        break
+                                await asyncio.sleep(0.01)
+
+                        ai.embed.side_effect = lambda texts, **kwargs: [vector(1) for _ in texts]
+                        async with client.stream("POST", "/api/v1/rag/chat/stream", json={"question": "No matching information"}) as response:
+                            lines = response.aiter_lines()
+                            _, no_context = await next_event(lines)
+                            self.assertEqual(no_context["sources"], [])
+                            self.assertEqual(await next_event(lines), ("delta", {"text": "I couldn't find the answer in the provided document."}))
+                            self.assertEqual((await next_event(lines))[0], "done")
+                            self.assertEqual([line async for line in lines], [])
+        finally:
+            gate.set()
+            if server is not None:
+                server.should_exit = True
+            if server_task is not None:
+                await asyncio.wait_for(server_task, 5)
+            sock.close()
+            app.dependency_overrides.clear()
+            if user_id is not None:
+                async with LocalSession() as db:
+                    await db.execute(delete(User).where(User.id == user_id))
+                    await db.commit()
+            await engine.dispose()
+
     async def test_existing_schema_migration_is_repeatable_and_preserves_records(self):
         from sqlalchemy import text
         from app.db.database import engine
@@ -306,6 +527,8 @@ class RagIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         ("GET", f"/conversations/{conversation_id}/messages", None),
                         ("DELETE", f"/conversations/{conversation_id}", None),
                         ("POST", "/chat", {"question": "Get private data", "document_ids": [document_id]}),
+                        ("POST", "/chat/stream", {"question": "Get private data", "document_ids": [document_id]}),
+                        ("POST", "/chat/stream", {"question": "Get private data", "conversation_id": conversation_id}),
                         ("POST", "/chat", {"question": "Get private data", "conversation_id": conversation_id}),
                     ]:
                         response = await client.request(method, "/api/v1/rag" + path, json=payload)

@@ -1,6 +1,10 @@
 import logging
 import math
 from pathlib import PurePath
+from dataclasses import dataclass
+from contextlib import aclosing
+
+import anyio
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -13,6 +17,7 @@ from app.models.auth.user import User
 from app.models.rag import Conversation, Document, DocumentChunk, DocumentStatus, Message, MessageRole, MessageSource
 from app.schemas.rag import ChatRequest
 from app.services.ai import AIProvider
+from app.utils.sse import encode_event
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +80,16 @@ async def conversation_messages(db: AsyncSession, conversation_id: int, after_id
             for message in messages]
 
 
-async def chat(db: AsyncSession, user: User, request: ChatRequest, settings: RagSettings, ai: AIProvider):
+@dataclass
+class ChatContext:
+    question: str
+    conversation: Conversation
+    history: list[dict]
+    sources: list[dict]
+    source_rows: list[tuple[int, dict]]
+
+
+async def prepare_chat(db: AsyncSession, user: User, request: ChatRequest, settings: RagSettings, ai: AIProvider) -> ChatContext:
     conversation = None
     history = []
     if request.conversation_id:
@@ -116,20 +130,65 @@ async def chat(db: AsyncSession, user: User, request: ChatRequest, settings: Rag
                   "page": chunk.pageNumber, "text": chunk.content, "score": round(score, 6)}
         sources.append(source)
         source_rows.append((chunk.id, source))
-    answer = await ai.answer(request.question, sources, history) if sources else (
-        "I couldn't find relevant information in your documents. Try a more specific question or upload another document."
-    )
     if conversation is None:
         conversation = Conversation(userId=user.id, title=request.question[:100])
         db.add(conversation)
         await db.flush()
-    question_message = Message(conversationId=conversation.id, role=MessageRole.USER, content=request.question)
-    answer_message = Message(conversationId=conversation.id, role=MessageRole.ASSISTANT, content=answer)
+    return ChatContext(request.question, conversation, history, sources, source_rows)
+
+
+async def persist_chat(db: AsyncSession, context: ChatContext, answer: str) -> int:
+    question_message = Message(conversationId=context.conversation.id, role=MessageRole.USER, content=context.question)
+    answer_message = Message(conversationId=context.conversation.id, role=MessageRole.ASSISTANT, content=answer)
     db.add_all([question_message, answer_message])
     await db.flush()
     db.add_all([MessageSource(messageId=answer_message.id, chunkId=chunk_id,
                               similarity=source["score"], snapshot=source)
-                for chunk_id, source in source_rows])
-    conversation_id = conversation.id
+                for chunk_id, source in context.source_rows])
+    message_id = answer_message.id
     await db.commit()
-    return {"conversation_id": conversation_id, "answer": answer, "sources": sources}
+    return message_id
+
+
+NO_ANSWER = "I couldn't find the answer in the provided document."
+
+
+async def chat(db: AsyncSession, user: User, request: ChatRequest, settings: RagSettings, ai: AIProvider):
+    context = await prepare_chat(db, user, request, settings, ai)
+    answer = await ai.answer(context.question, context.sources, context.history) if context.sources else NO_ANSWER
+    await persist_chat(db, context, answer)
+    return {"conversation_id": context.conversation.id, "answer": answer, "sources": context.sources}
+
+
+async def chat_stream(db: AsyncSession, context: ChatContext, ai: AIProvider, http_request):
+    """Stream immediately; save messages only after generation completes successfully."""
+    conversation_id = context.conversation.id
+    try:
+        yield encode_event("meta", {"conversation_id": conversation_id, "sources": context.sources})
+        parts = []
+        if context.sources:
+            async with aclosing(ai.answer_stream(context.question, context.sources, context.history)) as stream:
+                async for text in stream:
+                    if await http_request.is_disconnected():
+                        return
+                    parts.append(text)
+                    yield encode_event("delta", {"text": text})
+        else:
+            parts.append(NO_ANSWER)
+            yield encode_event("delta", {"text": NO_ANSWER})
+        if await http_request.is_disconnected():
+            return
+        answer = "".join(parts)
+        if not answer.strip() or len(answer) > 20000:
+            raise HTTPException(502, "Gemini returned an invalid streamed answer.")
+        message_id = await persist_chat(db, context, answer)
+        yield encode_event("done", {"conversation_id": conversation_id, "message_id": message_id})
+    except HTTPException as exc:
+        yield encode_event("error", {"status": exc.status_code, "message": exc.detail})
+    except Exception:
+        logger.error("Chat stream failed for conversation %s.", conversation_id)
+        yield encode_event("error", {"status": 500, "message": "The streamed answer could not be completed or saved. Please retry."})
+    finally:
+        # Protect rollback from cancellation when the browser closes its connection.
+        with anyio.CancelScope(shield=True):
+            await db.rollback()
