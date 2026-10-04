@@ -67,7 +67,7 @@ class RagSettings:
             api_url=os.getenv("RAG_API_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
             embedding_model=os.getenv("RAG_EMBEDDING_MODEL", "text-embedding-3-large"),
             chat_model=os.getenv("RAG_CHAT_MODEL", "gpt-4o-mini"),
-            cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", ""),
-            cloud_key=os.getenv("CLOUDINARY_API_KEY", ""),
-            cloud_secret=os.getenv("CLOUDINARY_API_SECRET", ""),
+            cloud_name=os.getenv("CLOUDNARY_CLOUD_NAME", ""),
+            cloud_key=os.getenv("CLOUDNARY_API_KEY", ""),
+            cloud_secret=os.getenv("CLOUDNARY_API_SECRET", ""),
         )
