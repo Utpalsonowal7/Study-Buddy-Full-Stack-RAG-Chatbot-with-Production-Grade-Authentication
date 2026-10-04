@@ -1,18 +1,13 @@
 import math
-import time
-from io import BytesIO
 
-import cloudinary.uploader
-import cloudinary.utils
 import httpx
 from fastapi import HTTPException
-from starlette.concurrency import run_in_threadpool
 
-from app.rag.settings import Settings, require_credentials
+from app.config import RagSettings, require_credentials
 
 
 class AIProvider:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: RagSettings):
         self.settings = settings
 
     async def _request(self, endpoint: str, payload: dict) -> dict:
@@ -35,14 +30,14 @@ class AIProvider:
         vectors = []
         for start in range(0, len(texts), 32):
             batch = texts[start:start + 32]
-            result = await self._request("embeddings", {"model": self.settings.embedding_model, "input": batch})
+            result = await self._request("embeddings", {"model": self.settings.embedding_model, "input": batch, "dimensions": 3072})
             try:
                 items = sorted(result["data"], key=lambda item: item["index"])
                 if [item["index"] for item in items] != list(range(len(batch))):
                     raise ValueError("Invalid embedding indexes")
                 for item in items:
                     vector = [float(value) for value in item["embedding"]]
-                    if not vector or len(vector) > 8192 or not all(math.isfinite(v) for v in vector) or math.hypot(*vector) == 0:
+                    if len(vector) != 3072 or not all(math.isfinite(v) for v in vector) or math.hypot(*vector) == 0:
                         raise ValueError("Invalid embedding")
                     if vectors and len(vector) != len(vectors[0]):
                         raise ValueError("Inconsistent dimensions")
@@ -73,35 +68,3 @@ class AIProvider:
             return answer.strip()
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise HTTPException(502, "AI provider returned an invalid answer.") from exc
-
-
-class CloudinaryStorage:
-    def __init__(self, settings: Settings):
-        self.settings = settings
-
-    def options(self) -> dict:
-        require_credentials(self.settings.cloud_name, self.settings.cloud_key, self.settings.cloud_secret)
-        return {"cloud_name": self.settings.cloud_name, "api_key": self.settings.cloud_key,
-                "api_secret": self.settings.cloud_secret, "resource_type": "raw", "type": "authenticated"}
-
-    async def upload(self, data: bytes, public_id: str) -> None:
-        options = self.options()
-        try:
-            await run_in_threadpool(cloudinary.uploader.upload, BytesIO(data),
-                                    public_id=public_id, overwrite=False, timeout=60, **options)
-        except Exception as exc:
-            raise HTTPException(502, "Cloudinary upload failed. Check storage settings and account limits.") from exc
-
-    async def delete(self, public_id: str) -> None:
-        options = self.options()
-        try:
-            result = await run_in_threadpool(cloudinary.uploader.destroy, public_id, invalidate=True, timeout=60, **options)
-            if result.get("result") not in {"ok", "not found"}:
-                raise ValueError("Unexpected deletion result")
-        except Exception as exc:
-            raise HTTPException(502, "Cloudinary deletion failed. Please retry.") from exc
-
-    def download_url(self, public_id: str) -> str:
-        return cloudinary.utils.private_download_url(
-            public_id, "", attachment=True, expires_at=int(time.time()) + 60, secure=True, **self.options()
-        )

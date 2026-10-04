@@ -11,9 +11,25 @@ from fastapi import HTTPException
 from pypdf import PdfWriter
 from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
 
-from app.rag.documents import extract_chunks, safe_filename
-from app.rag.providers import AIProvider, CloudinaryStorage
-from app.rag.settings import Settings
+# Configure the isolated test process before importing app.config.
+if os.getenv("TEST_DATABASE_URL"):
+    from sqlalchemy.engine import make_url
+    test_database = make_url(os.environ["TEST_DATABASE_URL"]).database
+    if not test_database or not test_database.startswith("study_buddy_test"):
+        raise ValueError("TEST_DATABASE_URL must name an isolated study_buddy_test* database.")
+    os.environ.update(DATABASE_URL=os.environ["TEST_DATABASE_URL"], REDIS_URL="redis://127.0.0.1:6379/15",
+                      JWT_ACCESS_TOKEN_SECRECT=secrets.token_urlsafe(48),
+                      JWT_REFRESH_TOKEN_SECRET=secrets.token_urlsafe(48), JWT_ALGORITHM="HS256",
+                      JWT_ACCESS_TOKEN_EXPIRE_MINUTES="15", JWT_REFRESH_TOKEN_EXPIRE_DAYS="30")
+
+from app.utils.documents import extract_chunks, safe_filename
+from app.services.ai import AIProvider
+from app.services.cloudinary import CloudinaryStorage
+from app.config import RagSettings as Settings
+
+
+def vector(index=0):
+    return [1.0 if i == index else 0.0 for i in range(3072)]
 
 
 def settings():
@@ -81,16 +97,17 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             requests.append(payload)
             self.assertEqual(request.headers["Authorization"], "Bearer test-key")
             if request.url.path.endswith("embeddings"):
-                return httpx.Response(200, json={"data": [{"index": 1, "embedding": [0, 1]},
-                                                         {"index": 0, "embedding": [1, 0]}]})
+                return httpx.Response(200, json={"data": [{"index": 1, "embedding": vector(1)},
+                                                         {"index": 0, "embedding": vector()}]})
             return httpx.Response(200, json={"choices": [{"message": {"content": "Light becomes chemical energy [1]."}}]})
         real_client = httpx.AsyncClient
-        with patch("app.rag.providers.httpx.AsyncClient", side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)):
+        with patch("app.services.ai.httpx.AsyncClient", side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)):
             ai = AIProvider(settings())
-            self.assertEqual(await ai.embed(["first", "second"]), [[1, 0], [0, 1]])
+            self.assertEqual(await ai.embed(["first", "second"]), [vector(), vector(1)])
             answer = await ai.answer("What happens?", [{"citation": 1, "filename": "notes.txt", "page": None, "text": "Light becomes chemical energy."}], [])
             self.assertIn("[1]", answer)
         self.assertEqual(requests[0]["model"], "test-embedding")
+        self.assertEqual(requests[0]["dimensions"], 3072)
         self.assertIn("untrusted", requests[1]["messages"][0]["content"])
 
     async def test_placeholder_and_invalid_provider_outputs(self):
@@ -107,7 +124,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_upstream_errors_do_not_expose_credentials(self):
         real_client = httpx.AsyncClient
-        with patch("app.rag.providers.httpx.AsyncClient", side_effect=lambda **kw: real_client(
+        with patch("app.services.ai.httpx.AsyncClient", side_effect=lambda **kw: real_client(
                 transport=httpx.MockTransport(lambda request: httpx.Response(401, json={"error": "private upstream details"})), **kw)):
             with self.assertRaises(HTTPException) as raised:
                 await AIProvider(settings()).embed(["hello"])
@@ -117,7 +134,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cloudinary_private_upload_delete_and_expiring_download(self):
         storage = CloudinaryStorage(settings())
-        with patch("cloudinary.uploader.upload", return_value={"public_id": "study-buddy/1/test.txt"}) as upload:
+        with patch("cloudinary.uploader.upload", return_value={"public_id": "study-buddy/1/test.txt", "secure_url": "https://res.cloudinary.com/test-cloud/raw/authenticated/test.txt"}) as upload:
             await storage.upload(b"hello", "study-buddy/1/test.txt")
             self.assertEqual(upload.call_args.kwargs["type"], "authenticated")
             self.assertEqual(upload.call_args.kwargs["resource_type"], "raw")
@@ -133,6 +150,34 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "Set TEST_DATABASE_URL to an isolated PostgreSQL test database")
 class RagIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_schema_migration_is_repeatable_and_preserves_records(self):
+        from sqlalchemy import text
+        from app.db.database import engine
+        from app.db.migrate_rag import migrate
+
+        schema = "rag_migration_test_" + secrets.token_hex(8)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+                await connection.execute(text(f'SET LOCAL search_path TO "{schema}", public'))
+                await connection.execute(text('CREATE TABLE docs (id INTEGER PRIMARY KEY, name TEXT)'))
+                await connection.execute(text('CREATE TABLE docs_chunks (id INTEGER PRIMARY KEY)'))
+                await connection.execute(text('CREATE TABLE message_sources (id INTEGER PRIMARY KEY, "chunkId" INTEGER NOT NULL REFERENCES docs_chunks(id) ON DELETE CASCADE)'))
+                await connection.execute(text("INSERT INTO docs VALUES (1, 'existing document')"))
+                await connection.execute(text('INSERT INTO docs_chunks VALUES (1)'))
+                await connection.execute(text('INSERT INTO message_sources VALUES (1, 1)'))
+                await migrate(connection)
+                await migrate(connection)
+                row = (await connection.execute(text('SELECT name, "embeddingModel", "chunkCount" FROM docs WHERE id=1'))).one()
+                self.assertEqual(tuple(row), ('existing document', 'legacy_unknown', 0))
+                await connection.execute(text('DELETE FROM docs_chunks WHERE id=1'))
+                row = (await connection.execute(text('SELECT "chunkId", snapshot FROM message_sources WHERE id=1'))).one()
+                self.assertIsNone(row[0])
+                self.assertEqual(row[1], {})
+                await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        finally:
+            await engine.dispose()
+
     async def test_authenticated_document_chat_lifecycle_and_isolation(self):
         from sqlalchemy.engine import make_url
         url = os.environ["TEST_DATABASE_URL"]
@@ -143,17 +188,17 @@ class RagIntegrationTests(unittest.IsolatedAsyncioTestCase):
                           JWT_ACCESS_TOKEN_EXPIRE_MINUTES="15", JWT_REFRESH_TOKEN_EXPIRE_DAYS="30")
         from app.main import app
         from app.db.database import engine, LocalSession
-        from app.rag.models import Chunk, Conversation, Document, Message
+        from app.models.rag import DocumentChunk, Conversation, Document, Message, MessageSource
         from app.models.auth.user import User
-        from app.rag.routes import get_ai, get_settings, get_storage
+        from app.dependencies.rag import get_ai, get_settings, get_storage
         from sqlalchemy import delete, select, func
         from sqlalchemy.ext.asyncio import AsyncSession
 
         ai = AIProvider(settings())
-        ai.embed = AsyncMock(side_effect=lambda texts: [[1.0, 0.0] for _ in texts])
+        ai.embed = AsyncMock(side_effect=lambda texts: [vector() for _ in texts])
         ai.answer = AsyncMock(return_value="Photosynthesis converts light into chemical energy [1].")
         storage = CloudinaryStorage(settings())
-        storage.upload = AsyncMock()
+        storage.upload = AsyncMock(return_value="https://res.cloudinary.com/test-cloud/raw/authenticated/test.txt")
         storage.delete = AsyncMock()
         app.dependency_overrides.update({get_ai: lambda: ai, get_settings: settings, get_storage: lambda: storage})
         emails = [f"rag-{secrets.token_hex(8)}@example.com" for _ in range(2)]
@@ -188,7 +233,7 @@ class RagIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     response = await client.get(f"/api/v1/rag/documents/{document_id}/download")
                     self.assertEqual(response.status_code, 200)
                     self.assertIn("expires_at", response.json()["url"])
-                    ai.embed.side_effect = lambda texts: [[0.0, 1.0] for _ in texts]
+                    ai.embed.side_effect = lambda texts: [vector(1) for _ in texts]
                     response = await client.post("/api/v1/rag/chat", json={"question": "Unrelated question"})
                     self.assertEqual(response.status_code, 200)
                     self.assertEqual(response.json()["sources"], [])
@@ -222,7 +267,7 @@ class RagIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     response = await client.post("/api/v1/rag/documents", files={"file": ("notes.txt", b"some notes")})
                     self.assertEqual(response.status_code, 502)
                     self.assertEqual(storage.upload.await_count, 1)
-                    ai.embed.side_effect = lambda texts: [[1.0, 0.0] for _ in texts]
+                    ai.embed.side_effect = lambda texts: [vector() for _ in texts]
                     storage.upload.side_effect = HTTPException(502, "Storage down")
                     response = await client.post("/api/v1/rag/documents", files={"file": ("notes.txt", b"some notes")})
                     self.assertEqual(response.status_code, 502)
@@ -240,12 +285,14 @@ class RagIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     storage.delete.side_effect = None
                     response = await client.delete(f"/api/v1/rag/documents/{document_id}")
                     self.assertEqual(response.status_code, 204)
+                    retained = await client.get(f"/api/v1/rag/conversations/{conversation_id}/messages")
+                    self.assertEqual(retained.json()[1]["sources"][0]["filename"], "biology.txt")
                     async with LocalSession() as db:
-                        self.assertEqual(await db.scalar(select(func.count(Chunk.id)).where(Chunk.document_id == document_id)), 0)
+                        self.assertEqual(await db.scalar(select(func.count(DocumentChunk.id)).where(DocumentChunk.documentId == document_id)), 0)
                     response = await client.delete(f"/api/v1/rag/conversations/{conversation_id}")
                     self.assertEqual(response.status_code, 204)
                     async with LocalSession() as db:
-                        self.assertEqual(await db.scalar(select(func.count(Message.id)).where(Message.conversation_id == conversation_id)), 0)
+                        self.assertEqual(await db.scalar(select(func.count(Message.id)).where(Message.conversationId == conversation_id)), 0)
                     response = await client.post("/api/v1/auth/refresh")
                     self.assertEqual(response.status_code, 200, response.text)
                     response = await client.post("/api/v1/auth/refresh")

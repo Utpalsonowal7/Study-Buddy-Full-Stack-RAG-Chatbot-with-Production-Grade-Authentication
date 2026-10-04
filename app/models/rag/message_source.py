@@ -2,6 +2,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Integer,
+    JSON,
     Float,
     DateTime,
     ForeignKey,
@@ -36,9 +37,9 @@ class MessageSource(Base):
         index=True,
     )
 
-    chunkId: Mapped[int] = mapped_column(
-        ForeignKey("document_chunks.id", ondelete="CASCADE"),
-        nullable=False,
+    chunkId: Mapped[int | None] = mapped_column(
+        ForeignKey("docs_chunks.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
 
@@ -46,6 +47,9 @@ class MessageSource(Base):
         Float,
         nullable=False,
     )
+
+    # Retain citations in chat history even after the original document is deleted.
+    snapshot: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict, server_default="{}")
 
     createdAt: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

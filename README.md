@@ -1,14 +1,29 @@
 # Study Buddy backend
 
-FastAPI authentication and a document RAG API. Signed-in users can upload study material, ask questions with source citations, keep conversations, and delete their documents. Original files are stored as **authenticated raw assets in Cloudinary**; extracted text, embeddings, document metadata, and conversations are stored in PostgreSQL. Redis supplies rate limiting and OTP storage.
+FastAPI authentication and a document RAG API. Signed-in users can upload study material, ask questions with source citations, keep conversations, and delete their documents. Original files are stored as **authenticated raw assets in Cloudinary**; extracted text, document metadata, conversations, and message sources use your existing PostgreSQL models. Embeddings use the existing pgvector `Vector(3072)` column. Redis supplies rate limiting and OTP storage.
 
-The API registers the models in `app/rag/models.py` (`rag_*` tables). Earlier model definitions in `app/models/rag/` are retained for reference but are not registered at startup; they require separate schema reconciliation before use.
+The project follows its original folders:
+
+```text
+app/routes/rag.py            # HTTP endpoints
+app/services/rag.py          # Indexing, retrieval, and conversations
+app/services/ai.py           # Embeddings and answers
+app/services/cloudinary.py   # Private file storage
+app/models/rag/              # Existing Document, DocumentChunk, Conversation,
+                             # Message, and MessageSource models
+app/schemas/rag.py           # Request and response validation
+app/dependencies/rag.py      # Provider dependency injection
+app/utils/documents.py       # File parsing and chunking
+app/config.py                # Auth and RAG configuration
+```
+
+There is no separate `app/rag` package or duplicate RAG model set. The existing model fields and integer document/conversation IDs are used throughout. The incorrect message-source foreign key is corrected to `docs_chunks.id`. Message sources retain citation snapshots after their source document is deleted.
 
 This checkout is the backend. It does not include a frontend or OCR. Provider credentials are intentionally placeholders, not working keys or simulated answers.
 
 ## Setup
 
-Requires Python 3.14+, `uv`, PostgreSQL with TLS, and Redis.
+Requires Python 3.14+, `uv`, PostgreSQL with TLS and the pgvector extension, and Redis.
 
 ```bash
 uv sync --frozen --python 3.14
@@ -17,7 +32,15 @@ cp .env.example .env  # only if you do not already have a .env
 
 Replace `RAG_API_KEY`, `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` in `.env` or secure deployment environment variables. Set separate random JWT signing keys, retaining the existing spelling `JWT_ACCESS_TOKEN_SECRECT`. Do not commit credentials. Missing or placeholder RAG/Cloudinary credentials return HTTP 503; no upload or model call is attempted with them.
 
-The default AI provider is OpenAI. Other OpenAI-compatible providers must support both `/embeddings` and `/chat/completions`; configure `RAG_API_BASE_URL`, `RAG_EMBEDDING_MODEL`, and `RAG_CHAT_MODEL` together. Do not change the embedding provider/model for an existing library without deleting and re-uploading its documents.
+The default AI provider is OpenAI, using `text-embedding-3-large` for 3072-dimensional embeddings. Other OpenAI-compatible providers must support both `/embeddings` and `/chat/completions`, including the `dimensions: 3072` embedding parameter; configure `RAG_API_BASE_URL`, `RAG_EMBEDDING_MODEL`, and `RAG_CHAT_MODEL` together. Do not change the embedding provider/model for an existing library without deleting and re-uploading its documents.
+
+If your database already has the original `docs` or `message_sources` tables, run the additive schema migration before starting the updated API:
+
+```bash
+uv run --frozen python -m app.db.migrate_rag
+```
+
+It adds document embedding-model/chunk-count metadata and citation snapshots, and fixes the message-source foreign key without dropping records. Existing untagged documents receive `legacy_unknown` and must be re-indexed before chat. It stops and rolls back if existing message sources reference missing chunks. PostgreSQL must have pgvector installed and the database user must be able to enable it (or an administrator must enable it first).
 
 ```bash
 uv run --frozen uvicorn app.main:app --host 127.0.0.1 --port 8000
@@ -31,7 +54,7 @@ bash /workspace/study-buddy-setup/start.sh
 .venv/bin/python /workspace/study-buddy-setup/check.py
 ```
 
-The helper starts disposable loopback PostgreSQL and Redis Docker containers, enables PostgreSQL TLS, and starts the backend with temporary development signing keys. Production needs persistent storage, secure database authentication, stable signing keys, HTTPS, and `COOKIE_SECURE=true`. Cookies default to secure and SameSite=Lax; the local helper opts into HTTP cookies. Placeholder JWT keys are rejected before registration writes to the database. Local helper keys change on restart; old tokens will then be invalid. The application creates the new RAG tables during startup using the existing `Base.metadata.create_all` workflow. Existing tables are not migrated by that command.
+The helper starts disposable loopback pgvector/PostgreSQL (port 5433) and Redis Docker containers, enables PostgreSQL TLS, and starts the backend with temporary development signing keys. Production needs persistent storage, secure database authentication, stable signing keys, HTTPS, and `COOKIE_SECURE=true`. Cookies default to secure and SameSite=Lax; the local helper opts into HTTP cookies. Placeholder JWT keys are rejected before registration writes to the database. Local helper keys change on restart; old tokens will then be invalid. The application registers `app/models/rag` and creates the original `docs`, `docs_chunks`, `conversations`, `messages`, and `message_sources` tables using the existing `Base.metadata.create_all` workflow. The vector extension is enabled before table creation. Existing table alterations require the migration command above. Any `rag_*` tables created by the previous implementation are left untouched; their UUID-based records are not read by this API. Export those records before migrating any data and re-upload documents to the original model schema; no old tables or assets are automatically deleted.
 
 ## Document and chat API
 
@@ -54,7 +77,7 @@ Example chat request:
 ```json
 {
   "question": "Explain photosynthesis in simple terms",
-  "document_ids": ["a-document-uuid"],
+  "document_ids": [1],
   "conversation_id": null
 }
 ```
@@ -80,7 +103,7 @@ Registration creates an unverified account; it no longer incorrectly marks an un
 
 - UTF-8 TXT/Markdown and text-based PDF files, up to 10 MiB and 200 PDF pages. Encrypted PDFs and scanned PDFs without text are rejected.
 - Overlapping chunks of about 1,800 characters; maximum 200 chunks per document and 2,000 per user. Delete documents to reclaim capacity.
-- Embeddings are persisted as JSON and ranked with cosine similarity for this bounded library. Move retrieval to an indexed vector database for larger workloads; this implementation does not claim unlimited-scale search.
+- Embeddings are persisted in the existing pgvector column and ranked in PostgreSQL with cosine distance. Only the selected user's ready documents are searched. The per-user indexing quota remains 2,000 chunks; tune quotas and add vector indexes after evaluating larger workloads.
 - At most six passages are sent to the model. The minimum cosine score is 0.25. Relevance and generated answers still need evaluation with your actual study material and chosen models.
 - Uploads are synchronous and rate limited to 10 per hour per client IP; chat is limited to 30 per minute. Configure trusted proxy headers at deployment and protect request body sizes at the reverse proxy.
 - Provider failures return 502. Unsupported files return 415, size/quota errors 413, empty/scanned documents 422, and incompatible embedding models 409.
@@ -96,13 +119,13 @@ The standard-library test suite needs no additional test dependencies:
 uv run --frozen python -m unittest discover -s tests -v
 ```
 
-The database integration test is skipped unless `TEST_DATABASE_URL` names a dedicated PostgreSQL database starting with `study_buddy_test`. It exercises real database tables and JWT authentication while mocking AI, Cloudinary, and the rate-limit call. It creates and cleans up its own users and records; never point it at production.
+The database integration tests are skipped unless `TEST_DATABASE_URL` names a dedicated PostgreSQL database starting with `study_buddy_test`. They exercise the original models, real pgvector queries, migration repeatability, and JWT authentication while mocking AI, Cloudinary, and the rate-limit call. They create and clean up their own users, records, and temporary migration schema; never point it at production.
 
 ```bash
 # With the prepared local PostgreSQL container:
-docker exec study-buddy-postgres createdb -U postgres study_buddy_test_rag
-TEST_DATABASE_URL=postgresql+asyncpg://postgres@127.0.0.1:5432/study_buddy_test_rag \
+docker exec study-buddy-vector-postgres createdb -U postgres study_buddy_test_rag
+TEST_DATABASE_URL=postgresql+asyncpg://postgres@127.0.0.1:5433/study_buddy_test_rag \
   uv run --frozen python -m unittest discover -s tests -v
 ```
 
-Coverage includes extraction and file rejection, provider request/response formats, private Cloudinary options, expiring downloads, authenticated upload/chat/history/deletion, source citations, cross-user isolation, insufficient retrieval, provider failures, and registration/refresh/logout. Real Cloudinary uploads and real model answers require credentials and are not validated by mocked tests. Optional network destinations include `api.openai.com` (or your configured AI hostname) and `api.cloudinary.com`.
+Coverage includes extraction and file rejection, provider request/response formats, private Cloudinary options, expiring downloads, authenticated upload/chat/history/deletion, source citations, cross-user isolation, insufficient retrieval, provider failures, registration/refresh/logout, and repeatable schema migration without losing existing records. Real Cloudinary uploads and real model answers require credentials and are not validated by mocked tests. Optional network destinations include `api.openai.com` (or your configured AI hostname) and `api.cloudinary.com`.

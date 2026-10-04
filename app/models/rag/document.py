@@ -84,6 +84,14 @@ class Document(Base):
         nullable=False,
     )
 
+    embeddingModel: Mapped[str] = mapped_column(
+        String(255), nullable=False, server_default="legacy_unknown",
+    )
+
+    chunkCount: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0",
+    )
+
     createdAt: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
