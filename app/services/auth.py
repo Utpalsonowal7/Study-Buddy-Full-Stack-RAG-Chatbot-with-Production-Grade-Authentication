@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import secrets
+import hashlib
+import jwt as pyjwt
 from urllib.parse import urlencode
 
 from fastapi import BackgroundTasks, HTTPException, Request, Response
@@ -13,7 +15,6 @@ from app.core.redis import redis
 from app.models.auth.session import Session
 from app.models.auth.user import User
 from app.schemas.auth import OTPRequest, OTPVerifyRequest, registerUserRequest
-from app.utils import jwt
 from app.utils.api_response import success_response
 from app.utils.cookie_options import (
     ACCESS_TOKEN_COOKIE_OPTIONS,
@@ -53,7 +54,7 @@ async def _set_auth_cookies(
 
     session = Session(
         user_id=user_id,
-        refresh_token_hash=tokens["refresh_token"],
+        refresh_token_hash=hashlib.sha256(tokens["refresh_token"].encode()).hexdigest(),
         expires_at=datetime.now(timezone.utc) + timedelta(days=30),
         user_agent=req.headers.get("user-agent"),
         ip_address=req.client.host if req.client else None,
@@ -148,6 +149,8 @@ async def register_user(
     req: Request,
     res: Response,
 ):
+    # Validate signing configuration before creating a user in the database.
+    create_auth_tokens({"sub": "configuration-check"})
     result = await db.execute(select(User).where(User.email == request.email))
 
     existing_user = result.scalar_one_or_none()
@@ -159,7 +162,7 @@ async def register_user(
         )
 
     user = User(
-        email=request.email, full_name=request.full_name, is_email_verified=True
+        email=request.email, name=request.full_name, is_email_verified=False
     )
 
     db.add(user)
@@ -186,7 +189,7 @@ async def register_user(
         "User registered successfully.",
         {
             "email": user.email,
-            "full_name": user.full_name,
+            "full_name": user.name,
         },
     )
 
@@ -232,6 +235,7 @@ async def verify_login_otp(
         request.email,
         request.otp,
     )
+    user.is_email_verified = True
 
     await _set_auth_cookies(
         res,
@@ -456,7 +460,6 @@ async def github_callback(
         return RedirectResponse(url=f"{FRONT_END_URL}userinfo_failed")
 
     profile = user_resp.json()
-    print(f"GitHub profile: {profile}")
     github_id = str(profile["id"])
     name = profile.get("name") or profile.get("login")
     avatar = profile.get("avatar_url")
@@ -492,9 +495,9 @@ async def github_callback(
             name=name,
             email=email,
             password=None,
-            isEmailVerified=True,
+            is_email_verified=True,
             provider="GITHUB",
-            providerId=github_id,
+            provider_id=github_id,
             avatar=avatar,
         )
         db.add(user)
@@ -521,11 +524,11 @@ async def refresh_access_token(request: Request, response: Response, db: AsyncSe
 
     try:
         payload = decode_refresh_token(refresh_token)
-    except jwt.ExpiredSignatureError as e:
+    except pyjwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=401, detail="Refresh token expired, please log in again"
         )
-    except jwt.InvalidTokenError as e:
+    except pyjwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     user_id = payload.get("sub")
@@ -533,7 +536,7 @@ async def refresh_access_token(request: Request, response: Response, db: AsyncSe
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
     result = await db.execute(
-        select(Session).where(Session.refreshToken == refresh_token)
+        select(Session).where(Session.refresh_token_hash == hashlib.sha256(refresh_token.encode()).hexdigest()).with_for_update()
     )
     session = result.scalar_one_or_none()
 
@@ -542,7 +545,10 @@ async def refresh_access_token(request: Request, response: Response, db: AsyncSe
             status_code=401, detail="Session not found, please log in again"
         )
 
-    if session.expiresAt < datetime.now(timezone.utc):
+    if str(session.user_id) != str(user_id):
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    if session.expires_at < datetime.now(timezone.utc):
         await db.delete(session)
         await db.commit()
         raise HTTPException(
@@ -551,8 +557,8 @@ async def refresh_access_token(request: Request, response: Response, db: AsyncSe
 
     tokens = create_auth_tokens({"sub": str(user_id)})
 
-    session.refreshToken = tokens["refresh_token"]
-    session.expiresAt = datetime.now(timezone.utc) + timedelta(days=30)
+    session.refresh_token_hash = hashlib.sha256(tokens["refresh_token"].encode()).hexdigest()
+    session.expires_at = datetime.now(timezone.utc) + timedelta(days=30)
     await db.commit()
 
     response.set_cookie(
@@ -574,7 +580,7 @@ async def logout_user(request: Request, response: Response, db: AsyncSession):
 
     if refresh_token:
         result = await db.execute(
-            select(Session).where(Session.refreshToken == refresh_token)
+            select(Session).where(Session.refresh_token_hash == hashlib.sha256(refresh_token.encode()).hexdigest())
         )
         session = result.scalar_one_or_none()
         if session:

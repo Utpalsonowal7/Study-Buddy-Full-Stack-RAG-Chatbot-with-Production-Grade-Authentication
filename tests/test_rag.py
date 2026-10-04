@@ -1,0 +1,265 @@
+import json
+import os
+import secrets
+import unittest
+from dataclasses import replace
+from io import BytesIO
+from unittest.mock import AsyncMock, patch
+
+import httpx
+from fastapi import HTTPException
+from pypdf import PdfWriter
+from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
+
+from app.rag.documents import extract_chunks, safe_filename
+from app.rag.providers import AIProvider, CloudinaryStorage
+from app.rag.settings import Settings
+
+
+def settings():
+    return Settings("test-key", "https://example.com/v1", "test-embedding", "test-chat",
+                    "test-cloud", "test-cloud-key", "test-cloud-secret")
+
+
+class ExtractionTests(unittest.TestCase):
+    def test_pdf_text_and_page_number(self):
+        writer = PdfWriter()
+        page = writer.add_blank_page(200, 200)
+        font = DictionaryObject({NameObject("/Type"): NameObject("/Font"),
+                                 NameObject("/Subtype"): NameObject("/Type1"),
+                                 NameObject("/BaseFont"): NameObject("/Helvetica")})
+        page[NameObject("/Resources")] = DictionaryObject({NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})})
+        stream = DecodedStreamObject()
+        stream.set_data(b"BT /F1 12 Tf 10 100 Td (Photosynthesis uses sunlight.) Tj ET")
+        page[NameObject("/Contents")] = writer._add_object(stream)
+        output = BytesIO()
+        writer.write(output)
+        content_type, chunks = extract_chunks(output.getvalue(), "biology.pdf")
+        self.assertEqual(content_type, "application/pdf")
+        self.assertEqual(chunks[0].page, 1)
+        self.assertIn("Photosynthesis uses sunlight", chunks[0].text)
+
+    def test_chunk_overlap_and_text_validation(self):
+        text = "Photosynthesis turns light into chemical energy. " * 100
+        content_type, chunks = extract_chunks(text.encode(), "notes.txt")
+        self.assertEqual(content_type, "text/plain")
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(chunks[0].text[-200:], chunks[1].text[:200])
+        self.assertEqual(safe_filename("../../notes.txt"), "notes.txt")
+        for data, name, status in [(b"", "notes.txt", 422), (b"\xff", "notes.txt", 400),
+                                   (b"binary\x00", "notes.md", 400), (b"hello", "file.exe", 415),
+                                   (b"fake", "notes.pdf", 400)]:
+            with self.subTest(name=name, data=data):
+                with self.assertRaises(HTTPException) as raised:
+                    extract_chunks(data, name)
+                self.assertEqual(raised.exception.status_code, status)
+        with self.assertRaises(HTTPException) as raised:
+            extract_chunks(text.encode(), "notes.txt", limit=1)
+        self.assertEqual(raised.exception.status_code, 413)
+
+    def test_scanned_and_encrypted_pdf(self):
+        writer = PdfWriter()
+        writer.add_blank_page(200, 200)
+        output = BytesIO()
+        writer.write(output)
+        with self.assertRaises(HTTPException) as raised:
+            extract_chunks(output.getvalue(), "blank.pdf")
+        self.assertEqual(raised.exception.status_code, 422)
+        writer.encrypt("test")
+        output = BytesIO()
+        writer.write(output)
+        with self.assertRaises(HTTPException) as raised:
+            extract_chunks(output.getvalue(), "encrypted.pdf")
+        self.assertEqual(raised.exception.status_code, 400)
+
+
+class ProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_openai_wire_format_and_ordering(self):
+        requests = []
+        def handler(request):
+            payload = json.loads(request.content)
+            requests.append(payload)
+            self.assertEqual(request.headers["Authorization"], "Bearer test-key")
+            if request.url.path.endswith("embeddings"):
+                return httpx.Response(200, json={"data": [{"index": 1, "embedding": [0, 1]},
+                                                         {"index": 0, "embedding": [1, 0]}]})
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Light becomes chemical energy [1]."}}]})
+        real_client = httpx.AsyncClient
+        with patch("app.rag.providers.httpx.AsyncClient", side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)):
+            ai = AIProvider(settings())
+            self.assertEqual(await ai.embed(["first", "second"]), [[1, 0], [0, 1]])
+            answer = await ai.answer("What happens?", [{"citation": 1, "filename": "notes.txt", "page": None, "text": "Light becomes chemical energy."}], [])
+            self.assertIn("[1]", answer)
+        self.assertEqual(requests[0]["model"], "test-embedding")
+        self.assertIn("untrusted", requests[1]["messages"][0]["content"])
+
+    async def test_placeholder_and_invalid_provider_outputs(self):
+        with self.assertRaises(HTTPException) as raised:
+            await AIProvider(replace(settings(), api_key="replace-me")).embed(["hello"])
+        self.assertEqual(raised.exception.status_code, 503)
+        for response in [{"data": []}, {"data": [{"index": 0, "embedding": [float('nan')]}]},
+                         {"data": [{"index": 0, "embedding": [0, 0]}]}]:
+            ai = AIProvider(settings())
+            ai._request = AsyncMock(return_value=response)
+            with self.assertRaises(HTTPException) as raised:
+                await ai.embed(["hello"])
+            self.assertEqual(raised.exception.status_code, 502)
+
+    async def test_upstream_errors_do_not_expose_credentials(self):
+        real_client = httpx.AsyncClient
+        with patch("app.rag.providers.httpx.AsyncClient", side_effect=lambda **kw: real_client(
+                transport=httpx.MockTransport(lambda request: httpx.Response(401, json={"error": "private upstream details"})), **kw)):
+            with self.assertRaises(HTTPException) as raised:
+                await AIProvider(settings()).embed(["hello"])
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertNotIn("test-key", raised.exception.detail)
+        self.assertNotIn("private upstream", raised.exception.detail)
+
+    async def test_cloudinary_private_upload_delete_and_expiring_download(self):
+        storage = CloudinaryStorage(settings())
+        with patch("cloudinary.uploader.upload", return_value={"public_id": "study-buddy/1/test.txt"}) as upload:
+            await storage.upload(b"hello", "study-buddy/1/test.txt")
+            self.assertEqual(upload.call_args.kwargs["type"], "authenticated")
+            self.assertEqual(upload.call_args.kwargs["resource_type"], "raw")
+            self.assertFalse(upload.call_args.kwargs["overwrite"])
+        url = storage.download_url("study-buddy/1/test.txt")
+        self.assertIn("expires_at=", url)
+        self.assertIn("type=authenticated", url)
+        self.assertNotIn("test-cloud-secret", url)
+        with patch("cloudinary.uploader.destroy", return_value={"result": "ok"}) as delete:
+            await storage.delete("study-buddy/1/test.txt")
+            self.assertEqual(delete.call_args.kwargs["type"], "authenticated")
+
+
+@unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "Set TEST_DATABASE_URL to an isolated PostgreSQL test database")
+class RagIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_authenticated_document_chat_lifecycle_and_isolation(self):
+        from sqlalchemy.engine import make_url
+        url = os.environ["TEST_DATABASE_URL"]
+        self.assertTrue(make_url(url).database.startswith("study_buddy_test"), "Use an isolated study_buddy_test* database")
+        os.environ.update(DATABASE_URL=url, REDIS_URL="redis://127.0.0.1:6379/15",
+                          JWT_ACCESS_TOKEN_SECRECT=secrets.token_urlsafe(48),
+                          JWT_REFRESH_TOKEN_SECRET=secrets.token_urlsafe(48), JWT_ALGORITHM="HS256",
+                          JWT_ACCESS_TOKEN_EXPIRE_MINUTES="15", JWT_REFRESH_TOKEN_EXPIRE_DAYS="30")
+        from app.main import app
+        from app.db.database import engine, LocalSession
+        from app.rag.models import Chunk, Conversation, Document, Message
+        from app.models.auth.user import User
+        from app.rag.routes import get_ai, get_settings, get_storage
+        from sqlalchemy import delete, select, func
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        ai = AIProvider(settings())
+        ai.embed = AsyncMock(side_effect=lambda texts: [[1.0, 0.0] for _ in texts])
+        ai.answer = AsyncMock(return_value="Photosynthesis converts light into chemical energy [1].")
+        storage = CloudinaryStorage(settings())
+        storage.upload = AsyncMock()
+        storage.delete = AsyncMock()
+        app.dependency_overrides.update({get_ai: lambda: ai, get_settings: settings, get_storage: lambda: storage})
+        emails = [f"rag-{secrets.token_hex(8)}@example.com" for _ in range(2)]
+        try:
+            async with app.router.lifespan_context(app), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://test") as client:
+                with patch("app.dependencies.rate_limit.rate_limit", new=AsyncMock()):
+                    response = await client.get("/api/v1/rag/documents")
+                    self.assertEqual(response.status_code, 401)
+                    response = await client.post("/api/v1/auth/register", json={"email": emails[0], "full_name": "Student"})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    owner_cookies = httpx.Cookies(client.cookies)
+                    response = await client.post("/api/v1/rag/documents", files={"file": ("biology.txt", b"Photosynthesis converts light into chemical energy.")})
+                    self.assertEqual(response.status_code, 201, response.text)
+                    document_id = response.json()["id"]
+                    self.assertEqual(response.json()["chunk_count"], 1)
+                    self.assertNotIn("public_id", response.json())
+                    response = await client.get("/api/v1/rag/documents")
+                    self.assertEqual([doc["id"] for doc in response.json()], [document_id])
+                    app.dependency_overrides[get_settings] = lambda: replace(settings(), max_chunks_per_user=1)
+                    response = await client.post("/api/v1/rag/documents", files={"file": ("extra.txt", b"More notes")})
+                    self.assertEqual(response.status_code, 413)
+                    app.dependency_overrides[get_settings] = settings
+                    response = await client.post("/api/v1/rag/chat", json={"question": "What is photosynthesis?", "document_ids": [document_id]})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    conversation_id = response.json()["conversation_id"]
+                    self.assertEqual(response.json()["sources"][0]["document_id"], document_id)
+                    response = await client.post("/api/v1/rag/chat", json={"question": "Explain it simply", "conversation_id": conversation_id})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(len(ai.answer.call_args.args[2]), 2)
+                    response = await client.get(f"/api/v1/rag/conversations/{conversation_id}/messages")
+                    self.assertEqual([message["role"] for message in response.json()], ["user", "assistant", "user", "assistant"])
+                    response = await client.get(f"/api/v1/rag/documents/{document_id}/download")
+                    self.assertEqual(response.status_code, 200)
+                    self.assertIn("expires_at", response.json()["url"])
+                    ai.embed.side_effect = lambda texts: [[0.0, 1.0] for _ in texts]
+                    response = await client.post("/api/v1/rag/chat", json={"question": "Unrelated question"})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()["sources"], [])
+                    self.assertEqual(ai.answer.await_count, 2)
+                    app.dependency_overrides[get_settings] = lambda: replace(settings(), embedding_model="different-model")
+                    response = await client.post("/api/v1/rag/chat", json={"question": "Explain"})
+                    self.assertEqual(response.status_code, 409)
+                    app.dependency_overrides[get_settings] = settings
+
+                    client.cookies.clear()
+                    response = await client.post("/api/v1/auth/register", json={"email": emails[1], "full_name": "Other student"})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual((await client.get("/api/v1/rag/documents")).json(), [])
+                    for method, path, payload in [
+                        ("GET", f"/documents/{document_id}", None),
+                        ("GET", f"/documents/{document_id}/download", None),
+                        ("DELETE", f"/documents/{document_id}", None),
+                        ("GET", f"/conversations/{conversation_id}/messages", None),
+                        ("DELETE", f"/conversations/{conversation_id}", None),
+                        ("POST", "/chat", {"question": "Get private data", "document_ids": [document_id]}),
+                        ("POST", "/chat", {"question": "Get private data", "conversation_id": conversation_id}),
+                    ]:
+                        response = await client.request(method, "/api/v1/rag" + path, json=payload)
+                        self.assertEqual(response.status_code, 404, (path, response.text))
+
+                    client.cookies.clear()
+                    client.cookies.update(owner_cookies)
+                    response = await client.post("/api/v1/rag/documents", files={"file": ("bad.exe", b"bad")})
+                    self.assertEqual(response.status_code, 415)
+                    ai.embed.side_effect = HTTPException(502, "Provider down")
+                    response = await client.post("/api/v1/rag/documents", files={"file": ("notes.txt", b"some notes")})
+                    self.assertEqual(response.status_code, 502)
+                    self.assertEqual(storage.upload.await_count, 1)
+                    ai.embed.side_effect = lambda texts: [[1.0, 0.0] for _ in texts]
+                    storage.upload.side_effect = HTTPException(502, "Storage down")
+                    response = await client.post("/api/v1/rag/documents", files={"file": ("notes.txt", b"some notes")})
+                    self.assertEqual(response.status_code, 502)
+                    self.assertEqual(len((await client.get("/api/v1/rag/documents")).json()), 1)
+                    storage.upload.side_effect = None
+                    with patch.object(AsyncSession, "commit", new=AsyncMock(side_effect=RuntimeError("Simulated database commit failure"))):
+                        with self.assertRaises(RuntimeError):
+                            await client.post("/api/v1/rag/documents", files={"file": ("rollback.txt", b"Rollback notes")})
+                    self.assertEqual(storage.delete.await_count, 1)
+                    self.assertEqual(len((await client.get("/api/v1/rag/documents")).json()), 1)
+                    storage.delete.side_effect = HTTPException(502, "Storage down")
+                    response = await client.delete(f"/api/v1/rag/documents/{document_id}")
+                    self.assertEqual(response.status_code, 502)
+                    self.assertEqual((await client.get(f"/api/v1/rag/documents/{document_id}")).status_code, 200)
+                    storage.delete.side_effect = None
+                    response = await client.delete(f"/api/v1/rag/documents/{document_id}")
+                    self.assertEqual(response.status_code, 204)
+                    async with LocalSession() as db:
+                        self.assertEqual(await db.scalar(select(func.count(Chunk.id)).where(Chunk.document_id == document_id)), 0)
+                    response = await client.delete(f"/api/v1/rag/conversations/{conversation_id}")
+                    self.assertEqual(response.status_code, 204)
+                    async with LocalSession() as db:
+                        self.assertEqual(await db.scalar(select(func.count(Message.id)).where(Message.conversation_id == conversation_id)), 0)
+                    response = await client.post("/api/v1/auth/refresh")
+                    self.assertEqual(response.status_code, 200, response.text)
+                    response = await client.post("/api/v1/auth/refresh")
+                    self.assertEqual(response.status_code, 200, response.text)
+                    response = await client.post("/api/v1/auth/logout")
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual((await client.get("/api/v1/rag/documents")).status_code, 401)
+        finally:
+            app.dependency_overrides.clear()
+            async with LocalSession() as db:
+                await db.execute(delete(User).where(User.email.in_(emails)))
+                await db.commit()
+            await engine.dispose()
+
+
+if __name__ == "__main__":
+    unittest.main()

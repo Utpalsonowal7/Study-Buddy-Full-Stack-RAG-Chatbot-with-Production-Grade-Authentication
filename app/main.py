@@ -9,6 +9,7 @@ from app.models.auth.user import User
 
 
 from app.routes.auth import router as auth_router
+from app.rag.routes import router as rag_router
 
 
 @asynccontextmanager
@@ -43,6 +44,7 @@ app.add_middleware(
 api_roter = APIRouter(prefix="/api/v1")
 
 api_roter.include_router(auth_router)
+api_roter.include_router(rag_router)
 
 app.include_router(api_roter)
 
