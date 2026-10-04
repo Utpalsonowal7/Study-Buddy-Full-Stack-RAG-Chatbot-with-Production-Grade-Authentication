@@ -2,6 +2,8 @@
 
 FastAPI authentication and a document RAG API. Signed-in users can upload study material, ask questions with source citations, keep conversations, and delete their documents. Original files are stored as **authenticated raw assets in Cloudinary**; extracted text, embeddings, document metadata, and conversations are stored in PostgreSQL. Redis supplies rate limiting and OTP storage.
 
+The API registers the models in `app/rag/models.py` (`rag_*` tables). Earlier model definitions in `app/models/rag/` are retained for reference but are not registered at startup; they require separate schema reconciliation before use.
+
 This checkout is the backend. It does not include a frontend or OCR. Provider credentials are intentionally placeholders, not working keys or simulated answers.
 
 ## Setup
