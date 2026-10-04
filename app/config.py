@@ -63,10 +63,10 @@ class RagSettings:
     @classmethod
     def from_env(cls):
         return cls(
-            api_key=os.getenv("RAG_API_KEY", ""),
-            api_url=os.getenv("RAG_API_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
-            embedding_model=os.getenv("RAG_EMBEDDING_MODEL", "text-embedding-3-large"),
-            chat_model=os.getenv("RAG_CHAT_MODEL", "gpt-4o-mini"),
+            api_key=os.getenv("GEMINI_API_KEY", ""),
+            api_url=os.getenv("GEMINI_API_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/"),
+            embedding_model=os.getenv("RAG_EMBEDDING_MODEL", "gemini-embedding-001"),
+            chat_model=os.getenv("RAG_CHAT_MODEL", "gemini-flash-latest"),
             cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", ""),
             cloud_key=os.getenv("CLOUDINARY_API_KEY", ""),
             cloud_secret=os.getenv("CLOUDINARY_API_SECRET", ""),
