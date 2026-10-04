@@ -33,7 +33,7 @@ def vector(index=0):
 
 
 def settings():
-    return Settings("test-key", "https://example.com/v1", "test-embedding", "test-chat",
+    return Settings("test-key", "https://generativelanguage.googleapis.com/v1beta", "test-embedding", "test-chat",
                     "test-cloud", "test-cloud-key", "test-cloud-secret")
 
 
@@ -90,32 +90,83 @@ class ExtractionTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.IsolatedAsyncioTestCase):
-    async def test_openai_wire_format_and_ordering(self):
+    async def test_gemini_wire_format_task_types_and_conversation(self):
         requests = []
         def handler(request):
             payload = json.loads(request.content)
-            requests.append(payload)
-            self.assertEqual(request.headers["Authorization"], "Bearer test-key")
-            if request.url.path.endswith("embeddings"):
-                return httpx.Response(200, json={"data": [{"index": 1, "embedding": vector(1)},
-                                                         {"index": 0, "embedding": vector()}]})
-            return httpx.Response(200, json={"choices": [{"message": {"content": "Light becomes chemical energy [1]."}}]})
+            requests.append((request.url.path, payload))
+            self.assertEqual(request.headers["x-goog-api-key"], "test-key")
+            self.assertNotIn("Authorization", request.headers)
+            self.assertEqual(request.url.query, b"")
+            if request.url.path.endswith(":batchEmbedContents"):
+                return httpx.Response(200, json={"embeddings": [{"values": vector(index)} for index in range(len(payload["requests"]))]})
+            return httpx.Response(200, json={"candidates": [{"finishReason": "STOP", "content": {"parts": [
+                {"text": "Internal reasoning", "thought": True},
+                {"text": "Light becomes chemical energy "}, {"text": "[1]."}]}}]})
         real_client = httpx.AsyncClient
         with patch("app.services.ai.httpx.AsyncClient", side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)):
             ai = AIProvider(settings())
             self.assertEqual(await ai.embed(["first", "second"]), [vector(), vector(1)])
-            answer = await ai.answer("What happens?", [{"citation": 1, "filename": "notes.txt", "page": None, "text": "Light becomes chemical energy."}], [])
-            self.assertIn("[1]", answer)
-        self.assertEqual(requests[0]["model"], "test-embedding")
-        self.assertEqual(requests[0]["dimensions"], 3072)
-        self.assertIn("untrusted", requests[1]["messages"][0]["content"])
+            self.assertEqual(await ai.embed(["question"], task_type="RETRIEVAL_QUERY"), [vector()])
+            answer = await ai.answer("What happens?", [{"citation": 1, "filename": "notes.txt", "page": None, "text": "Light becomes chemical energy."}],
+                                     [{"role": "user", "content": "Explain light"}, {"role": "assistant", "content": "Earlier answer [1]."}])
+            self.assertEqual(answer, "Light becomes chemical energy [1].")
+        self.assertEqual(requests[0][0], "/v1beta/models/test-embedding:batchEmbedContents")
+        for item in requests[0][1]["requests"]:
+            self.assertEqual(item["model"], "models/test-embedding")
+            self.assertEqual(item["outputDimensionality"], 3072)
+            self.assertEqual(item["taskType"], "RETRIEVAL_DOCUMENT")
+        self.assertEqual(requests[1][1]["requests"][0]["taskType"], "RETRIEVAL_QUERY")
+        self.assertEqual(requests[2][0], "/v1beta/models/test-chat:generateContent")
+        self.assertIn("untrusted", requests[2][1]["systemInstruction"]["parts"][0]["text"])
+        self.assertEqual([content["role"] for content in requests[2][1]["contents"]], ["user", "model", "user"])
+        self.assertIn("[1] notes.txt", requests[2][1]["contents"][-1]["parts"][0]["text"])
+
+    async def test_gemini_embedding_batches_preserve_order(self):
+        ai = AIProvider(settings())
+        async def response(endpoint, payload):
+            return {"embeddings": [{"values": vector(int(item["content"]["parts"][0]["text"]))} for item in payload["requests"]]}
+        ai._request = AsyncMock(side_effect=response)
+        vectors = await ai.embed([str(index) for index in range(33)])
+        self.assertEqual(vectors, [vector(index) for index in range(33)])
+        self.assertEqual([len(call.args[1]["requests"]) for call in ai._request.call_args_list], [32, 1])
+
+    async def test_gemini_blocked_incomplete_and_invalid_answers(self):
+        for result, status in [
+            ({"promptFeedback": {"blockReason": "SAFETY"}}, 422),
+            ({"candidates": [{"finishReason": "SAFETY"}]}, 422),
+            ({"candidates": [{"finishReason": "MAX_TOKENS"}]}, 502),
+            ({"candidates": []}, 502),
+            ({"promptFeedback": "invalid", "candidates": []}, 502),
+            ({"candidates": ["invalid"]}, 502),
+            ({"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "Hidden", "thought": True}]}}]}, 502),
+        ]:
+            with self.subTest(result=result):
+                ai = AIProvider(settings())
+                ai._request = AsyncMock(return_value=result)
+                with self.assertRaises(HTTPException) as raised:
+                    await ai.answer("What happens?", [], [])
+                self.assertEqual(raised.exception.status_code, status)
+
+    def test_gemini_defaults_and_existing_model_resource_names(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-gemini-key"}):
+            for name in ["GEMINI_API_BASE_URL", "RAG_EMBEDDING_MODEL", "RAG_CHAT_MODEL"]:
+                os.environ.pop(name, None)
+            configured = Settings.from_env()
+        self.assertEqual(configured.api_key, "test-gemini-key")
+        self.assertEqual(configured.api_url, "https://generativelanguage.googleapis.com/v1beta")
+        self.assertEqual(configured.embedding_model, "gemini-embedding-001")
+        self.assertEqual(configured.chat_model, "gemini-flash-latest")
+        self.assertEqual(AIProvider.model_path("models/gemini-embedding-001"), "models/gemini-embedding-001")
+        with self.assertRaises(HTTPException):
+            AIProvider.model_path("../invalid/model")
 
     async def test_placeholder_and_invalid_provider_outputs(self):
         with self.assertRaises(HTTPException) as raised:
             await AIProvider(replace(settings(), api_key="replace-me")).embed(["hello"])
         self.assertEqual(raised.exception.status_code, 503)
-        for response in [{"data": []}, {"data": [{"index": 0, "embedding": [float('nan')]}]},
-                         {"data": [{"index": 0, "embedding": [0, 0]}]}]:
+        for response in [{"embeddings": []}, {"embeddings": [{"values": [float('nan')] * 3072}]},
+                         {"embeddings": [{"values": [0] * 3072}]}, {"embeddings": [{"values": [1, 0]}]}]:
             ai = AIProvider(settings())
             ai._request = AsyncMock(return_value=response)
             with self.assertRaises(HTTPException) as raised:
@@ -195,7 +246,7 @@ class RagIntegrationTests(unittest.IsolatedAsyncioTestCase):
         from sqlalchemy.ext.asyncio import AsyncSession
 
         ai = AIProvider(settings())
-        ai.embed = AsyncMock(side_effect=lambda texts: [vector() for _ in texts])
+        ai.embed = AsyncMock(side_effect=lambda texts, **kwargs: [vector() for _ in texts])
         ai.answer = AsyncMock(return_value="Photosynthesis converts light into chemical energy [1].")
         storage = CloudinaryStorage(settings())
         storage.upload = AsyncMock(return_value="https://res.cloudinary.com/test-cloud/raw/authenticated/test.txt")
@@ -223,6 +274,7 @@ class RagIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     app.dependency_overrides[get_settings] = settings
                     response = await client.post("/api/v1/rag/chat", json={"question": "What is photosynthesis?", "document_ids": [document_id]})
                     self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(ai.embed.call_args.kwargs["task_type"], "RETRIEVAL_QUERY")
                     conversation_id = response.json()["conversation_id"]
                     self.assertEqual(response.json()["sources"][0]["document_id"], document_id)
                     response = await client.post("/api/v1/rag/chat", json={"question": "Explain it simply", "conversation_id": conversation_id})
@@ -233,7 +285,7 @@ class RagIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     response = await client.get(f"/api/v1/rag/documents/{document_id}/download")
                     self.assertEqual(response.status_code, 200)
                     self.assertIn("expires_at", response.json()["url"])
-                    ai.embed.side_effect = lambda texts: [vector(1) for _ in texts]
+                    ai.embed.side_effect = lambda texts, **kwargs: [vector(1) for _ in texts]
                     response = await client.post("/api/v1/rag/chat", json={"question": "Unrelated question"})
                     self.assertEqual(response.status_code, 200)
                     self.assertEqual(response.json()["sources"], [])
@@ -267,7 +319,7 @@ class RagIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     response = await client.post("/api/v1/rag/documents", files={"file": ("notes.txt", b"some notes")})
                     self.assertEqual(response.status_code, 502)
                     self.assertEqual(storage.upload.await_count, 1)
-                    ai.embed.side_effect = lambda texts: [vector() for _ in texts]
+                    ai.embed.side_effect = lambda texts, **kwargs: [vector() for _ in texts]
                     storage.upload.side_effect = HTTPException(502, "Storage down")
                     response = await client.post("/api/v1/rag/documents", files={"file": ("notes.txt", b"some notes")})
                     self.assertEqual(response.status_code, 502)

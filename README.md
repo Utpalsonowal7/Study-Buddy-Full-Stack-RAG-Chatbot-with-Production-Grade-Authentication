@@ -30,9 +30,24 @@ uv sync --frozen --python 3.14
 cp .env.example .env  # only if you do not already have a .env
 ```
 
-Replace `RAG_API_KEY`, `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` in `.env` or secure deployment environment variables. Set separate random JWT signing keys, retaining the existing spelling `JWT_ACCESS_TOKEN_SECRECT`. Do not commit credentials. Missing or placeholder RAG/Cloudinary credentials return HTTP 503; no upload or model call is attempted with them.
+Replace `GEMINI_API_KEY`, `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` in `.env` or secure deployment environment variables. Set separate random JWT signing keys, retaining the existing spelling `JWT_ACCESS_TOKEN_SECRECT`. Do not commit credentials. Missing or placeholder RAG/Cloudinary credentials return HTTP 503; no upload or model call is attempted with them.
 
-The default AI provider is OpenAI, using `text-embedding-3-large` for 3072-dimensional embeddings. Other OpenAI-compatible providers must support both `/embeddings` and `/chat/completions`, including the `dimensions: 3072` embedding parameter; configure `RAG_API_BASE_URL`, `RAG_EMBEDDING_MODEL`, and `RAG_CHAT_MODEL` together. Do not change the embedding provider/model for an existing library without deleting and re-uploading its documents.
+The AI service uses the **native Gemini Developer API**. Create your key in [Google AI Studio](https://aistudio.google.com/app/apikey) and configure:
+
+```dotenv
+GEMINI_API_KEY=replace_me_with_your_gemini_key
+GEMINI_API_BASE_URL=https://generativelanguage.googleapis.com/v1beta
+RAG_EMBEDDING_MODEL=gemini-embedding-001
+RAG_CHAT_MODEL=gemini-flash-latest
+```
+
+`gemini-embedding-001` supports the existing 3072-dimensional pgvector column. Uploads use `RETRIEVAL_DOCUMENT`; questions use `RETRIEVAL_QUERY`. Embedding requests are batched, and all returned vectors are checked for the correct dimensions and finite, nonzero values. The chat service calls `generateContent` with source excerpts, system instructions, and conversation history mapped to Gemini's `user`/`model` roles. Blocked requests return 422; incomplete or invalid model responses return 502. Thought parts are excluded from saved answers.
+
+The `gemini-flash-latest` alias follows Google's current Flash release; set `RAG_CHAT_MODEL` to a specific available Gemini model if you need a fixed version. The embedding client supports models with the `gemini-embedding-001` retrieval task contract; switching to `gemini-embedding-2` requires adapting its task instructions, not just changing the model name.
+
+If you already copied the older `.env.example`, update your existing `.env` entries manually. `RAG_API_KEY` and `RAG_API_BASE_URL` from the OpenAI version are no longer used. Old `text-embedding-3-large`/`gpt-4o-mini` model values must also be replaced. Documents indexed with OpenAI embeddings must be deleted and re-uploaded to generate Gemini embeddings; the API rejects mismatched embedding models rather than mixing vector spaces. Existing tables, Cloudinary settings, and folder structure are unchanged by this provider switch.
+
+Request formats were checked against Google's [official API definitions](https://github.com/googleapis/googleapis/blob/master/google/ai/generativelanguage/v1beta/generative_service.proto) and [embedding cookbook](https://github.com/google-gemini/cookbook/blob/main/quickstarts/Embeddings.ipynb). Real calls still require a valid key with access and quota for the configured models.
 
 If your database already has the original `docs` or `message_sources` tables, run the additive schema migration before starting the updated API:
 
@@ -128,4 +143,4 @@ TEST_DATABASE_URL=postgresql+asyncpg://postgres@127.0.0.1:5433/study_buddy_test_
   uv run --frozen python -m unittest discover -s tests -v
 ```
 
-Coverage includes extraction and file rejection, provider request/response formats, private Cloudinary options, expiring downloads, authenticated upload/chat/history/deletion, source citations, cross-user isolation, insufficient retrieval, provider failures, registration/refresh/logout, and repeatable schema migration without losing existing records. Real Cloudinary uploads and real model answers require credentials and are not validated by mocked tests. Optional network destinations include `api.openai.com` (or your configured AI hostname) and `api.cloudinary.com`.
+Coverage includes extraction and file rejection, native Gemini request/response formats, retrieval task types, batching, and blocked/incomplete replies, private Cloudinary options, expiring downloads, authenticated upload/chat/history/deletion, source citations, cross-user isolation, insufficient retrieval, provider failures, registration/refresh/logout, and repeatable schema migration without losing existing records. Real Cloudinary uploads and real model answers require credentials and are not validated by mocked tests. Optional network destinations include `generativelanguage.googleapis.com` and `api.cloudinary.com`.

@@ -97,7 +97,7 @@ async def chat(db: AsyncSession, user: User, request: ChatRequest, settings: Rag
         raise HTTPException(409, "The embedding model changed. Re-upload documents using the current model.")
 
     previous_questions = [message["content"] for message in history if message["role"] == "user"][-2:]
-    query_vector = (await ai.embed(["\n".join([*previous_questions, request.question])]))[0]
+    query_vector = (await ai.embed(["\n".join([*previous_questions, request.question])], task_type="RETRIEVAL_QUERY"))[0]
     if len(query_vector) != 3072 or not all(math.isfinite(value) for value in query_vector) or not math.hypot(*query_vector):
         raise HTTPException(502, "The embedding provider must return a valid 3072-dimensional query vector.")
     # Rank vectors in PostgreSQL using the project's existing pgvector column.
