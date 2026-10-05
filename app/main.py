@@ -7,6 +7,7 @@ from app.db.database import engine, Base
 
 from app.models.auth.session import Session
 from app.models.auth.user import User
+import app.models.rag
 
 
 
