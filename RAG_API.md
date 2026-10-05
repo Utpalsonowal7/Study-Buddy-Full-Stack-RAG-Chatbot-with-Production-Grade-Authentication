@@ -14,6 +14,8 @@ The backend requires PostgreSQL with pgvector, Redis, a real Gemini API key (`RA
 
 ## Endpoint list
 
+Public health endpoint: **GET `/api/v1/health`**, without authentication. It checks PostgreSQL (`SELECT 1`) and Redis (`PING`) concurrently, with a three-second timeout per service. Healthy response: HTTP 200, `{"status":"ok","checks":{"database":"ok","redis":"ok"}}`. An unavailable dependency returns HTTP 503 with `status: "degraded"` and the affected check set to `"unavailable"`. Responses are not cached. This checks backend readiness; it does not call Gemini or Cloudinary or validate their credentials.
+
 Paths are relative to `API`. All document and conversation IDs are positive integers. Responses are direct objects/arrays, without a `data` wrapper.
 
 | Method | Path | Input | Success response |
