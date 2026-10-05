@@ -48,7 +48,6 @@ def require_credentials(*values: str) -> None:
 @dataclass(frozen=True)
 class RagSettings:
     api_key: str
-    api_url: str
     embedding_model: str
     chat_model: str
     cloud_name: str
@@ -64,8 +63,6 @@ class RagSettings:
     def from_env(cls):
         return cls(
             api_key=os.getenv("RAG_API_KEY") or os.getenv("GEMINI_API_KEY", ""),
-            api_url=(os.getenv("RAG_API_BASE_URL") or os.getenv("GEMINI_API_BASE_URL")
-                     or "https://generativelanguage.googleapis.com/v1beta").rstrip("/"),
             embedding_model=os.getenv("RAG_EMBEDDING_MODEL", "gemini-embedding-001"),
             chat_model=os.getenv("RAG_CHAT_MODEL", "gemini-3.1-flash-lite"),
             cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", ""),

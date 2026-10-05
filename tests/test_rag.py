@@ -7,6 +7,9 @@ import unittest
 from dataclasses import replace
 from io import BytesIO
 from unittest.mock import AsyncMock, patch
+from google import genai
+from google.genai import types
+from contextlib import contextmanager
 
 import httpx
 from fastapi import HTTPException
@@ -36,8 +39,25 @@ def vector(index=0):
 
 
 def settings():
-    return Settings("test-key", "https://generativelanguage.googleapis.com/v1beta", "test-embedding", "test-chat",
+    return Settings("test-key", "test-embedding", "test-chat",
                     "test-cloud", "test-cloud-key", "test-cloud-secret")
+
+
+def gemini_event(payload):
+    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+
+@contextmanager
+def sdk_transport(handler):
+    real_client = genai.Client
+    def client(**kwargs):
+        options = kwargs["http_options"].model_copy(update={
+            "httpx_async_client": httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            "retry_options": types.HttpRetryOptions(attempts=1),
+        })
+        return real_client(**{**kwargs, "http_options": options})
+    with patch("app.services.ai.genai.Client", side_effect=client):
+        yield
 
 
 class ExtractionTests(unittest.TestCase):
@@ -127,8 +147,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={"candidates": [{"finishReason": "STOP", "content": {"parts": [
                 {"text": "Internal reasoning", "thought": True},
                 {"text": "Light becomes chemical energy "}, {"text": "[1]."}]}}]})
-        real_client = httpx.AsyncClient
-        with patch("app.services.ai.httpx.AsyncClient", side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)):
+        with sdk_transport(handler):
             ai = AIProvider(settings())
             self.assertEqual(await ai.embed(["first", "second"]), [vector(), vector(1)])
             self.assertEqual(await ai.embed(["question"], task_type="RETRIEVAL_QUERY"), [vector()])
@@ -151,11 +170,11 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         class GatedStream(httpx.AsyncByteStream):
             closed = False
             async def __aiter__(self):
-                first = encode_event("message", {"candidates": [{"content": {"parts": [{"text": "First 🌱 "}]}}]}).encode()
+                first = gemini_event({"candidates": [{"content": {"parts": [{"text": "First 🌱 "}]}}]}).encode()
                 for piece in [first[:35], first[35:]]:
                     yield piece
                 await gate.wait()
-                yield encode_event("message", {"candidates": [{"content": {"parts": [{"text": "second [1]."}]}, "finishReason": "STOP"}]}).encode()
+                yield gemini_event({"candidates": [{"content": {"parts": [{"text": "second [1]."}]}, "finishReason": "STOP"}]}).encode()
             async def aclose(self):
                 self.closed = True
         body = GatedStream()
@@ -167,8 +186,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["generationConfig"]["temperature"], 0.2)
             self.assertIn("short answers short", payload["systemInstruction"]["parts"][0]["text"])
             return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=body)
-        real_client = httpx.AsyncClient
-        with patch("app.services.ai.httpx.AsyncClient", side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)):
+        with sdk_transport(handler):
             stream = AIProvider(settings()).answer_stream("Explain", [], [])
             self.assertEqual(await asyncio.wait_for(anext(stream), 1), "First 🌱 ")
             self.assertFalse(gate.is_set())
@@ -179,10 +197,8 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(body.closed)
 
     async def test_gemini_stream_rejects_truncated_response(self):
-        body = encode_event("message", {"candidates": [{"content": {"parts": [{"text": "Partial"}]}}]})
-        real_client = httpx.AsyncClient
-        with patch("app.services.ai.httpx.AsyncClient", side_effect=lambda **kw: real_client(
-                transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)), **kw)):
+        body = gemini_event({"candidates": [{"content": {"parts": [{"text": "Partial"}]}}]})
+        with sdk_transport(lambda request: httpx.Response(200, text=body)):
             stream = AIProvider(settings()).answer_stream("Explain", [], [])
             self.assertEqual(await anext(stream), "Partial")
             with self.assertRaises(HTTPException) as raised:
@@ -221,7 +237,6 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                 os.environ.pop(name, None)
             configured = Settings.from_env()
         self.assertEqual(configured.api_key, "test-gemini-key")
-        self.assertEqual(configured.api_url, "https://generativelanguage.googleapis.com/v1beta")
         self.assertEqual(configured.embedding_model, "gemini-embedding-001")
         self.assertEqual(configured.chat_model, "gemini-3.1-flash-lite")
         self.assertEqual(AIProvider.model_path("models/gemini-embedding-001"), "models/gemini-embedding-001")
@@ -234,15 +249,11 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                                      "GEMINI_API_BASE_URL": "https://unused.example.com"}):
             configured = Settings.from_env()
         self.assertEqual(configured.api_key, "generic-gemini-key")
-        self.assertEqual(configured.api_url, "https://generativelanguage.googleapis.com/v1beta")
 
-    async def test_legacy_openai_endpoint_is_rejected_before_sending_gemini_key(self):
-        provider = AIProvider(replace(settings(), api_url="https://api.openai.com/v1"))
-        with patch("app.services.ai.httpx.AsyncClient") as client:
-            with self.assertRaises(HTTPException) as raised:
-                await provider.embed(["text"])
-            self.assertEqual(raised.exception.status_code, 503)
-            client.assert_not_called()
+    async def test_base_url_environment_is_not_used(self):
+        with patch.dict(os.environ, {"RAG_API_BASE_URL": "https://api.openai.com/v1"}):
+            configured = Settings.from_env()
+        self.assertFalse(hasattr(configured, "api_url"))
 
     async def test_placeholder_and_invalid_provider_outputs(self):
         with self.assertRaises(HTTPException) as raised:
@@ -257,9 +268,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(raised.exception.status_code, 502)
 
     async def test_upstream_errors_do_not_expose_credentials(self):
-        real_client = httpx.AsyncClient
-        with patch("app.services.ai.httpx.AsyncClient", side_effect=lambda **kw: real_client(
-                transport=httpx.MockTransport(lambda request: httpx.Response(401, json={"error": "private upstream details"})), **kw)):
+        with sdk_transport(lambda request: httpx.Response(401, json={"error": {"code": 401, "message": "private upstream details", "status": "UNAUTHENTICATED"}})):
             with self.assertRaises(HTTPException) as raised:
                 await AIProvider(settings()).embed(["hello"])
         self.assertEqual(raised.exception.status_code, 502)

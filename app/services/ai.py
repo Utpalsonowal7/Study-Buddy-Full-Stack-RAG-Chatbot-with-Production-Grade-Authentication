@@ -1,12 +1,13 @@
 import math
 import re
-from urllib.parse import urlsplit
+from contextlib import aclosing
 
 import httpx
+from google import genai
+from google.genai import errors, types
 from fastapi import HTTPException
 
 from app.config import RagSettings, require_credentials
-from app.utils.sse import decode_json_events
 
 
 class AIProvider:
@@ -22,28 +23,40 @@ class AIProvider:
             raise HTTPException(503, "Configure a valid Gemini model name in the server environment.")
         return f"models/{name}"
 
-    def validate_api_url(self) -> None:
-        url = urlsplit(self.settings.api_url)
-        if url.scheme != "https" or not url.hostname or url.hostname == "api.openai.com":
-            raise HTTPException(503, "Configure an HTTPS Gemini API base URL, such as https://generativelanguage.googleapis.com/v1beta.")
+    def client(self):
+        require_credentials(self.settings.api_key)
+        return genai.Client(api_key=self.settings.api_key, vertexai=False,
+                            http_options=types.HttpOptions(api_version="v1beta", timeout=90000)).aio
+
+    @staticmethod
+    def generation_args(payload: dict) -> dict:
+        return {
+            "contents": payload["contents"],
+            "config": types.GenerateContentConfig(
+                system_instruction=payload["systemInstruction"]["parts"][0]["text"],
+                temperature=payload["generationConfig"]["temperature"],
+                max_output_tokens=payload["generationConfig"]["maxOutputTokens"],
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            ),
+        }
 
     async def _request(self, endpoint: str, payload: dict) -> dict:
-        require_credentials(self.settings.api_key)
-        self.validate_api_url()
         try:
-            async with httpx.AsyncClient(timeout=90) as client:
-                response = await client.post(
-                    f"{self.settings.api_url}/{endpoint}",
-                    # Keep API keys out of URL query strings and application logs.
-                    headers={"x-goog-api-key": self.settings.api_key},
-                    json=payload,
-                )
-                response.raise_for_status()
-                result = response.json()
-                if not isinstance(result, dict):
-                    raise ValueError("Invalid Gemini response")
-                return result
-        except (httpx.HTTPError, ValueError) as exc:
+            async with self.client() as client:
+                model, operation = endpoint.split(":", 1)
+                if operation == "batchEmbedContents":
+                    requests = payload["requests"]
+                    result = await client.models.embed_content(
+                        model=model,
+                        contents=[item["content"] for item in requests],
+                        config=types.EmbedContentConfig(
+                            task_type=requests[0]["taskType"], output_dimensionality=3072),
+                    )
+                else:
+                    result = await client.models.generate_content(
+                        model=model, **self.generation_args(payload))
+                return result.model_dump(by_alias=True, exclude_none=True)
+        except (errors.APIError, httpx.HTTPError, ValueError) as exc:
             raise HTTPException(502, "Gemini request failed. Check the API key, model access, quota, and provider availability.") from exc
 
     async def embed(self, texts: list[str], *, task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
@@ -126,21 +139,15 @@ class AIProvider:
 
     async def answer_stream(self, question: str, sources: list[dict], history: list[dict]):
         """Yield actual Gemini text deltas as received, before the answer completes."""
-        require_credentials(self.settings.api_key)
-        self.validate_api_url()
         model = self.model_path(self.settings.chat_model)
         finished, has_text, size = False, False, 0
         try:
-            async with httpx.AsyncClient(timeout=90) as client:
-                async with client.stream(
-                    "POST", f"{self.settings.api_url}/{model}:streamGenerateContent",
-                    params={"alt": "sse"},
-                    headers={"x-goog-api-key": self.settings.api_key, "Accept": "text/event-stream"},
-                    json=self.answer_payload(question, sources, history),
-                ) as response:
-                    response.raise_for_status()
-                    async for result in decode_json_events(response.aiter_lines()):
-                        text, finish_reason = self.response_text(result)
+            async with self.client() as client:
+                stream = await client.models.generate_content_stream(
+                    model=model, **self.generation_args(self.answer_payload(question, sources, history)))
+                async with aclosing(stream):
+                    async for chunk in stream:
+                        text, finish_reason = self.response_text(chunk.model_dump(by_alias=True, exclude_none=True))
                         size += len(text)
                         if size > 20000:
                             raise HTTPException(502, "Gemini returned an oversized answer.")
@@ -149,8 +156,7 @@ class AIProvider:
                             yield text
                         if finish_reason == "STOP":
                             finished = True
-                            break
-        except httpx.HTTPError as exc:
+        except (errors.APIError, httpx.HTTPError, ValueError) as exc:
             raise HTTPException(502, "Gemini stream failed. Check model access, quota, and provider availability.") from exc
         if not finished or not has_text:
             raise HTTPException(502, "Gemini did not complete its streamed answer.")
