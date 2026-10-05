@@ -10,7 +10,7 @@ const API = "http://localhost:8000/api/v1";
 
 Use `localhost` consistently for frontend and backend during local testing. Backend `.env` needs `COOKIE_SECURE=false` for local HTTP; restart after changing it. Production uses HTTPS and secure cookies. Allowed local frontend origins include `http://localhost:3000`, `http://localhost:5173`, and `http://127.0.0.1:5173`. Add other origins to CORS in `app/main.py`. A frontend on an unrelated production site needs cookie/CORS configuration appropriate to that deployment.
 
-The backend requires PostgreSQL with pgvector, Redis, a real Gemini API key (`RAG_API_KEY` or `GEMINI_API_KEY`), and Cloudinary credentials. Gemini uses the official `google-genai` SDK; no API base URL setting is needed. Default models are `gemini-embedding-001` and `gemini-3.1-flash-lite`. Never include provider credentials in frontend code.
+The backend requires PostgreSQL with pgvector, Redis, a real Gemini API key (`RAG_API_KEY` or `GEMINI_API_KEY`), and Cloudinary credentials (`CLOUDNARY_CLOUD_NAME`, `CLOUDNARY_API_KEY`, `CLOUDNARY_API_SECRET`, matching the current configuration spelling). Gemini uses the official `google-genai` SDK; no API base URL setting is needed. Default models are `gemini-embedding-001` and `gemini-3.1-flash-lite`. Never include provider credentials in frontend code.
 
 ## Endpoint list
 
