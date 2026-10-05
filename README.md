@@ -19,20 +19,20 @@ The repository contains the backend. Frontend integration is documented in [RAG_
 
 ```mermaid
 flowchart LR
-    UI[Frontend] --> API[FastAPI routes]
-    API --> AUTH[Cookie authentication and ownership checks]
-    AUTH --> RAG[RAG service]
-    API --> REDIS[(Redis: OTP and rate limits)]
-    RAG --> PARSE[Extract and chunk documents]
-    PARSE --> EMBED[Gemini embedding SDK]
-    EMBED --> DB[(PostgreSQL and pgvector)]
-    RAG --> STORAGE[Private Cloudinary files]
-    RAG --> DB
-    DB --> CONTEXT[Retrieved excerpts and history]
-    CONTEXT --> GEN[Gemini generation SDK]
-    GEN --> SSE[SSE text deltas]
-    SSE --> UI
-    RAG --> HISTORY[(Messages and citation snapshots)]
+    frontend["Frontend"] --> api["FastAPI routes"]
+    api --> auth["Cookie authentication and ownership checks"]
+    auth --> rag["RAG service"]
+    api --> redisStore[("Redis: OTP and rate limits")]
+    rag --> extraction["Extract and chunk documents"]
+    extraction --> embedding["Gemini embedding SDK"]
+    embedding --> vectorStore[("PostgreSQL and pgvector")]
+    rag --> fileStore["Private Cloudinary files"]
+    rag --> vectorStore
+    vectorStore --> context["Retrieved excerpts and history"]
+    context --> generation["Gemini generation SDK"]
+    generation --> stream["SSE text deltas"]
+    stream --> frontend
+    rag --> historyStore[("Messages and citation snapshots")]
 ```
 
 ### Document ingestion
