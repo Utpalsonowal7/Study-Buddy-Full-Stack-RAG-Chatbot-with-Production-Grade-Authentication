@@ -7,7 +7,7 @@ from app.db.database import engine, Base
 
 from app.models.auth.session import Session
 from app.models.auth.user import User
-
+import app.models.rag
 
 
 from app.routes.auth import router as auth_router
@@ -22,6 +22,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    await engine.dispose()
 
 app = FastAPI(lifespan=lifespan)
 
