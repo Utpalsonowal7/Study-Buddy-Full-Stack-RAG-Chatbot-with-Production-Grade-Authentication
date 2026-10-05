@@ -297,6 +297,8 @@ app/
 
 ## Deployment checklist and next steps
 
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the Docker workflow and Render Blueprint instructions. `render.yaml` configures a web service using existing PostgreSQL and Redis services.
+
 Use TLS for browser traffic, stable signing secrets, secure cookies, authenticated persistent PostgreSQL/Redis, and a private secret store. Configure trusted proxy handling, CORS, request-size limits, and SSE timeouts for your deployment. Review cross-site cookie requirements if frontend and backend are on unrelated sites. Validate provider access and backups before release.
 
 Planned improvements include Alembic schema migrations, durable background ingestion, OCR, retrieval-quality evaluation, vector-index benchmarking, and structured operational telemetry. This repository implements the core backend; a frontend, live deployment evidence, and performance benchmarks are not included.
